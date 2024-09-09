@@ -33,15 +33,28 @@ Protocols are standarized rules and conventions that define how data is transmit
 Topologies refer to the arrangement of various elements(nodes, links etc) in a computer network.
 
 1. ### Bus Topology
-All devices are connected to a single central cable, known as bus or backbone.
+  All devices are connected to a single central cable, known as bus or backbone.
+  
+   ![Bus Topology Image](images/image.png)
+  
+  __Advantages:__
+  - Simple to implement and extend. 
+  - Requires less cable than other topologies. 
+  
+  __Disadvantages:__
+  - A failure in the central cable can disable the entire network. 
+  - Performance degrades as more devices are added.
 
+2. ### Ring Topology
+   Each Device is connected to two other devices, forming a circular pathway for data. Data travels in one direction (or in both directions in a dual ring topology)
+   
+ ![Ring Topology Image](images/ring-topology.png)
 
+   __Advantages:__
+    - Data is transferred quickly with minimal collisions.
+    - Predictable network performance.
+    __Disadvantages:__
+    - A failure in any cable or device can break the loop and take down the network.
+    - Difficult to troubleshoot and modify.
 
-__Advantages:__
-- Simple to implement and extend. 
-- Requires less cable than other topologies. 
-
-__Disadvantages:__
-- A failure in the central cable can disable the entire network. 
-- Performance degrades as more devices are added.
-
+   
