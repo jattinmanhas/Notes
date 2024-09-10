@@ -52,9 +52,30 @@ Topologies refer to the arrangement of various elements(nodes, links etc) in a c
 
    __Advantages:__
     - Data is transferred quickly with minimal collisions.
-    - Predictable network performance.
+    - Predictable network performance
+
     __Disadvantages:__
     - A failure in any cable or device can break the loop and take down the network.
     - Difficult to troubleshoot and modify.
 
+3. ### Star Topology
+All devices are connected to a central hub or switch. Data is sent to the central hub from a device which then routes to the destination device.
+
+    __Advantages:__
+     - Easy to install and manage.
+     - Failure in one cable does not affect other devices.
+
+     __Disadvantages:__
+      - If central hub fails, entire network goes down.
+
+4. ### Mesh Topology
+Every device is connected to every other device. There are two types: Full Mesh (where every device is interconnected) and Partial Mesh (where some devices are interconnected).
+
+     __Advantages:__
+      - Highly robust and reliable; if one link fails, data can take alternative paths.
+      - No single point of failure.
+
+     __Disadvantages:__
+     - Expensive to implement.
+     - Complex to install and manage.
    
