@@ -1,48 +1,81 @@
 # LLD Q2 — Design an Elevator System (Java)
 
-> **Interview framing:** The classic trap here is to jump straight to "I'll use a priority queue" and start coding. The signal the interviewer wants is: *do you model the domain correctly first* (hall call vs. car call is the single biggest tell), *do you know the real algorithms by name* (LOOK / collective control / destination dispatch), and *do you separate the per-car algorithm from the multi-car dispatcher*.
+> **What the interviewer is really checking:**
+> 1. Do you model the domain first? The biggest tell is knowing that a **hall call** (button outside) and a **car call** (button inside) are different things.
+> 2. Do you know the real algorithms by name? **LOOK** for one car, **cost/ETA-based dispatch** for many cars.
+> 3. Do you keep "which car?" and "in what order?" as two separate pieces of code?
+>
+> The common mistake is saying "I'll use a priority queue" and starting to code straight away.
 
 ---
 
 ## Table of Contents
 
-1. [The Problem in One Paragraph](#1-the-problem-in-one-paragraph)
+0. [The Whole Design in 60 Seconds](#0-the-whole-design-in-60-seconds)
+1. [The Problem](#1-the-problem)
 2. [Clarifying Questions to Ask First](#2-clarifying-questions-to-ask-first)
 3. [Requirements](#3-requirements)
-4. [Domain Vocabulary (get this right first)](#4-domain-vocabulary-get-this-right-first)
-5. [System Modeling](#5-system-modeling)
-6. [Scheduling Algorithms](#6-scheduling-algorithms)
-7. [Request Processing & Peak Periods](#7-request-processing--peak-periods)
+4. [Vocabulary](#4-vocabulary)
+5. [Modelling the System](#5-modelling-the-system)
+6. [Algorithms](#6-algorithms)
+7. [How Requests Flow & Peak Periods](#7-how-requests-flow--peak-periods)
 8. [The Code](#8-the-code)
-9. [End-to-End Walkthroughs](#9-end-to-end-walkthroughs)
+9. [Walkthroughs (real output)](#9-walkthroughs-real-output)
 10. [Extensibility](#10-extensibility)
 11. [Failure & Safety Scenarios](#11-failure--safety-scenarios)
 12. [Testing Strategy](#12-testing-strategy)
 13. [Interview Cheat Sheet](#13-interview-cheat-sheet)
+14. [What Changed From the Previous Version](#14-what-changed-from-the-previous-version)
 
 ---
 
-## 1. The Problem in One Paragraph
+## 0. The Whole Design in 60 Seconds
 
-A building has `F` floors and `N` elevator cars. People press **hall buttons** (up/down, in the lobby of each floor) and **car buttons** (destination floor, inside the car). The system must decide (a) *which car* serves each hall call — the **dispatch** problem — and (b) *in what order* a given car serves the stops it owns — the **scheduling** problem. It must minimise waiting time and travel time, never violate safety constraints (doors, capacity, overtravel), and behave sensibly during rush hours when traffic is heavily directional.
+If you remember nothing else, remember these six points:
 
-Two distinct problems, two distinct components. Candidates who conflate them end up with one 400-line `ElevatorSystem` god class.
+1. **Two kinds of button.** A *hall call* = `(floor, UP/DOWN)`, pressed outside. Any car can answer it. A *car call* = `(floor)`, pressed inside. Only that car can answer it.
+2. **Two problems, two classes.** `Dispatcher` decides **which car** gets a hall call. `ElevatorCar` decides **in what order** it visits its stops.
+3. **One car uses LOOK.** Keep going in your current direction, stopping at every requested floor. When nothing is left ahead, turn around.
+4. **LOOK uses two sorted sets**: `upStops` and `downStops` (`TreeSet`). "Next stop above me" is just `upStops.ceiling(currentFloor)`.
+5. **Many cars use a cost function.** Estimate how long each car would take to reach the caller (its ETA), add small penalties for busy or crowded cars, and pick the lowest score.
+6. **Rush hours.** Work out the traffic mode (up-peak, down-peak, …) from what passengers actually do, then park idle cars where the next call is likely to come from.
 
-| Sub-problem | Owner in my design | Classic algorithm |
-|---|---|---|
-| Which car takes this hall call? | `Dispatcher` (system-wide) | Cost/ETA-based dispatch, zoning, destination dispatch |
-| What order does this car stop? | `ElevatorCar` (per car) | **LOOK** (the "elevator algorithm") |
+Plus one safety rule that sits above everything: **the car never moves unless the door is closed**, and one line of code enforces it.
+
+---
+
+## 1. The Problem
+
+A building has `F` floors and `N` elevator cars. People press:
+
+- **hall buttons** (UP / DOWN) in the lift lobby on each floor, and
+- **car buttons** (a floor number) inside the car.
+
+The system has to answer two questions:
+
+| Question | Name | Who answers it in this design | Algorithm |
+|---|---|---|---|
+| Which car should go to this hall call? | **Dispatch** | `Dispatcher` (one for the whole building) | Cost / ETA-based |
+| In what order should this car visit its stops? | **Scheduling** | `ElevatorCar` (each car) | **LOOK** |
+
+Goals: short waiting times, no one waiting forever, never break a safety rule (doors, capacity), and handle rush hours sensibly.
+
+> If you mix the two questions into one class, you get a 400-line `ElevatorSystem` god class. Keeping them apart is the main design decision.
 
 ---
 
 ## 2. Clarifying Questions to Ask First
 
-1. **"How many cars and how many floors?"** — 1 car changes everything (no dispatcher needed); 4 cars / 20 floors is the interesting default. *(Assume N cars, F floors, basements allowed → floors can be negative.)*
-2. **"Do all cars serve all floors?"** — express cars, service floors, restricted floors (badge access). *(Assume a per-car `servesFloor(f)` predicate — cheap to add, shows foresight.)*
-3. **"Conventional buttons or destination dispatch?"** — i.e. does the passenger enter their destination in the hall? *(Assume conventional up/down, discuss destination dispatch as an extension — it's the modern answer and worth 5 minutes.)*
-4. **"Do we simulate physics or is it discrete-time?"** — *(Assume a discrete tick simulation: one tick = one floor of travel or one door phase. Keeps the code testable.)*
-5. **"Do we need capacity / load sensors?"** — *(Assume yes: a full car must not accept new hall calls. This is a real constraint that improves the design.)*
-6. **"Single process or distributed?"** — *(Assume single controller process; mention that real systems have a group controller + per-car controllers on a field bus.)*
+Ask these, and say what you'll assume if the interviewer says "your choice":
+
+| # | Question | Why it matters | Assumption |
+|---|---|---|---|
+| 1 | How many cars and floors? | 1 car = no dispatcher needed | N cars, F floors, basements allowed (floors can be negative) |
+| 2 | Do all cars serve all floors? | Express cars, restricted floors | Each car has a `servesFloor(f)` check |
+| 3 | Up/down buttons or destination keypads in the lobby? | Changes the whole dispatch model | Up/down buttons; discuss destination dispatch as an extension |
+| 4 | Real time or simulated? | Testability | Discrete ticks: **1 tick = time to travel one floor** |
+| 5 | Do cars have load sensors? | A full car shouldn't take more pickups | Yes |
+| 6 | One process or distributed? | Concurrency model | One controller process, one control thread |
 
 ---
 
@@ -52,1204 +85,1300 @@ Two distinct problems, two distinct components. Candidates who conflate them end
 
 | # | Requirement |
 |---|---|
-| F1 | Accept **hall calls**: `(floor, UP\|DOWN)`. |
-| F2 | Accept **car calls**: `(carId, destinationFloor)`. |
-| F3 | Assign each hall call to exactly one car, minimising expected wait. |
-| F4 | Each car serves its stops in **LOOK** order (sweep in one direction, reverse at the last stop). |
-| F5 | Open/close doors with dwell time; re-open on obstruction or door-open button. |
-| F6 | Refuse boarding when at capacity; skip hall calls the car cannot serve. |
-| F7 | Support emergency stop, fire-service mode, and maintenance (out-of-service) mode. |
-| F8 | Adapt behaviour to traffic pattern: up-peak, down-peak, lunch, off-peak. |
-| F9 | Park idle cars at strategic floors based on the traffic mode. |
+| F1 | Accept hall calls `(floor, UP/DOWN)`. |
+| F2 | Accept car calls `(carId, floor)`. |
+| F3 | Give every hall call to exactly one car, aiming for the shortest wait. |
+| F4 | Each car visits its stops in LOOK order. |
+| F5 | Open doors, wait (dwell), close. Re-open if something blocks the door. |
+| F6 | A full car takes no new hall calls. An overloaded car won't close its doors. |
+| F7 | Support emergency stop, maintenance mode and fire recall. When a car stops working, its hall calls go to other cars. |
+| F8 | Detect the traffic pattern: up-peak, down-peak, lunch, normal, off-peak. |
+| F9 | Park idle cars at useful floors depending on the traffic pattern. |
 
 ### 3.2 Non-Functional
 
 | # | Requirement | How the design meets it |
 |---|---|---|
-| N1 | **Minimise average wait time (AWT)** | Cost-based dispatch, not nearest-car |
-| N2 | **Bounded worst-case wait (no starvation)** | Age term in the cost function + LOOK guarantees a sweep completes |
-| N3 | **Safety is non-negotiable** | Car cannot move with doors open — enforced in the state machine, not by convention |
-| N4 | **Deterministic & testable** | Discrete tick loop, injected `Clock`, no `Thread.sleep` in domain code |
-| N5 | **Extensible dispatch policy** | `Dispatcher` is an interface; swap nearest-car ↔ cost-based ↔ zoned ↔ destination |
-| N6 | **Thread-safe** | One command queue per system; car state mutated only on the control thread |
+| N1 | Short average wait | Cost-based dispatch (in simulation: **26.8 vs 35.4 ticks** for nearest-car, see §9.4) |
+| N2 | Nobody waits forever | LOOK bounds the wait inside a car. Every call is assigned right away (or queued, oldest first). See §6.5. |
+| N3 | Safety | "Don't move with the door open" is checked in code in one place |
+| N4 | Testable | Time is a tick counter. No `Thread.sleep`, no wall clock in domain code |
+| N5 | Easy to change policies | `Dispatcher` and `ParkingPolicy` are interfaces (Strategy pattern) |
+| N6 | Thread-safe | Every button press and tick runs on one control thread (§8.8), so the domain code needs no locks |
 
 ### 3.3 Out of Scope
 
-Motor control / VFD ramps, exact kinematics (accel/jerk), building fire code specifics, elevator group networking protocols, machine-room hardware.
+Motor control, acceleration curves, fire-code specifics, hardware protocols.
 
 ---
 
-## 4. Domain Vocabulary (get this right first)
+## 4. Vocabulary
 
-**Say these terms out loud. They immediately signal you've thought about elevators rather than about queues.**
+Using these words in the interview shows you've thought about elevators, not just queues.
 
 | Term | Meaning | Why it matters |
 |---|---|---|
-| **Hall call** | Button *outside* the car: `(floor, direction)`. The passenger states a **direction**, not a destination. | Owned by the **system** — any car can serve it. This is what the dispatcher assigns. |
-| **Car call** | Button *inside* the car: `(destination floor)`. | Owned by **one specific car** — it cannot be reassigned. |
-| **Collective control** | The car answers all calls in its current direction of travel, in floor order. | This is what "the elevator algorithm" actually is in the industry. |
-| **Full collective** | Both hall directions and car calls are collected. | The standard for most modern buildings. |
-| **Sweep / run** | One pass from lowest to highest stop (or reverse). | LOOK = sweep, reverse at the last *requested* floor. |
-| **Dwell time** | How long doors stay open. | ~3s for a car call, longer for a hall call (people walking to the car). |
-| **Up-peak / down-peak** | Morning arrival / evening departure traffic. | The two peak modes that need special handling. |
-| **Handling capacity** | % of building population moved in 5 minutes. | The metric a real elevator consultant optimises. |
-| **AWT / ATT** | Average Waiting Time / Average Transit Time. | The two numbers your dispatcher trades off. |
-| **Parking / homing** | Sending idle cars to strategic floors. | Cheap win for up-peak. |
+| **Hall call** | Button *outside* the car. Says a **direction**, not a destination. | Belongs to the building. The dispatcher chooses a car for it. |
+| **Car call** | Button *inside* the car. Says a **destination floor**. | Belongs to that one car. Never moved to another car. |
+| **Collective control** | A car picks up every call in its direction of travel, in floor order. | This is what people mean by "the elevator algorithm". |
+| **Sweep** | One trip in one direction (e.g. from the lowest stop to the highest). | LOOK = sweep, then turn around at the last *requested* floor. |
+| **Dwell time** | How long the doors stay open. | Real systems use a longer dwell for hall calls, because people have to walk over. |
+| **Hall lantern** | The arrow above the lift door showing which way the car will go. | Tells waiting passengers whether to get in. |
+| **Up-peak / down-peak** | Morning arrivals / evening departures. | The two rush-hour patterns. |
+| **AWT** | Average Waiting Time (button press → doors open). | The number the dispatcher tries to minimise. |
+| **Parking / homing** | Sending idle cars to chosen floors. | Cheap, big improvement at rush hour. |
 
-> **The single biggest modelling mistake:** treating a hall call as `(floor)` with no direction. A person on floor 7 pressing **DOWN** should *not* be picked up by a car sweeping upward to floor 12 — it would carry them the wrong way. Direction is part of the call's identity.
+> **The #1 modelling mistake:** storing a hall call as just a floor. Someone on floor 7 who pressed **DOWN** must *not* be picked up by a car going **up** to floor 12. It would take them the wrong way. The direction is part of what the call *is*.
 
 ---
 
-## 5. System Modeling
+## 5. Modelling the System
 
-### 5.1 Entity model
+### 5.1 The pieces
 
 ```
-Building
- ├── floors: [minFloor .. maxFloor]           (may include basements: -2, -1, 0, 1, ...)
- ├── hallPanels: Map<Floor, HallPanel>        (button lamps — a call stays lit until served)
- └── ElevatorGroup  ("group controller")
-      ├── cars: List<ElevatorCar>
-      ├── dispatcher: Dispatcher              (strategy — which car gets a hall call)
-      ├── trafficMonitor: TrafficMonitor      (detects UP_PEAK / DOWN_PEAK / ...)
-      └── parkingPolicy: ParkingPolicy        (where do idle cars wait)
+Building                 min floor, max floor, lobby floor
 
-ElevatorCar   ("car controller")
- ├── id, currentFloor, committedDirection, state
- ├── door: Door(state, dwellTicksRemaining)
- ├── upStops:   TreeSet<Integer>              ← stops to serve while travelling UP
- ├── downStops: TreeSet<Integer>              ← stops to serve while travelling DOWN
- ├── capacity, currentLoad
- └── servesFloor(f): boolean
+ElevatorSystem           "group controller" - one per building
+ ├── cars              : List<ElevatorCar>
+ ├── dispatcher        : Dispatcher          which car gets a hall call   (Strategy)
+ ├── trafficMonitor    : TrafficMonitor      which rush-hour mode are we in
+ ├── parkingPolicy     : ParkingPolicy       where idle cars wait         (Strategy)
+ ├── waitingSince      : Map<HallCall, tick> lit hall buttons (also de-duplicates presses)
+ └── unassigned        : Queue<HallCall>     calls no car could take yet
+
+ElevatorCar              "car controller" - one per car
+ ├── currentFloor, direction, state, load, capacity
+ ├── door              : Door                its own small state machine
+ ├── upStops           : TreeSet<Integer>    stops to make while going UP
+ ├── downStops         : TreeSet<Integer>    stops to make while going DOWN
+ ├── hallCalls         : Set<HallCall>       which stops came from hall buttons
+ └── parkingFloor      : Integer             where to wait when idle (optional)
 ```
 
-### 5.2 Why **two** `TreeSet`s and not one priority queue
+Why does the car remember `hallCalls` separately? If the car breaks down, the system has to give its hall calls to other cars **with their directions**. The stop lists only contain floor numbers, so they can't tell you that.
 
-This is the core data-structure insight and it's worth stating explicitly.
+### 5.2 Hall call vs car call in code
 
-A single `PriorityQueue<Integer>` ordered by distance gives you **SSTF**, which starves far floors and produces jerky, unnatural service. What you actually want is: *"while going up, stop at every requested floor above me, in increasing order."* That is exactly `upStops.ceiling(currentFloor)` on a `TreeSet` — **O(log n)**, and reversal is `downStops.last()`.
+```java
+record HallCall(int floor, Direction direction) { }   // a type of its own - direction is part of it
+void addCarCall(int floor)                            // just a floor, sent straight to one car
+```
 
-| Operation | Structure | Cost |
+A `record` compares by value, so two people pressing UP on floor 7 create **equal** `HallCall` objects. Putting them in a `Map` or `Set` removes duplicates for free.
+
+### 5.3 Why two `TreeSet`s and not one priority queue
+
+This is the key data-structure idea. Explain it clearly in the interview.
+
+**The wrong idea:** one `PriorityQueue` sorted by distance from the car. That always goes to the *closest* stop, which is the algorithm called **SSTF**. If people keep pressing buttons near the lobby, the car stays near the lobby and floor 20 waits forever.
+
+**What we actually want:** *"While going up, stop at every requested floor above me, lowest first. Then come back down, stopping at every requested floor, highest first."*
+
+A `TreeSet` keeps its numbers sorted and gives us exactly the queries we need:
+
+| Question the car asks | Code | Cost |
 |---|---|---|
-| Add a stop | `TreeSet.add` | O(log k) |
-| Next stop while going up | `upStops.ceiling(cur)` | O(log k) |
-| Reversal point | `upStops.last()` / `downStops.first()` | O(log k) |
-| Is floor already requested? | `contains` | O(log k) |
-| De-duplication (two people press the same button) | `Set` semantics | free |
+| Next stop above me (going up)? | `upStops.ceiling(currentFloor)` → smallest value ≥ current | O(log k) |
+| Next stop below me (going down)? | `downStops.floor(currentFloor)` → largest value ≤ current | O(log k) |
+| Where does the next down-sweep start? | `downStops.last()` → highest value | O(log k) |
+| Add a stop | `add(floor)` | O(log k) |
+| Same button pressed twice? | It's a `Set` - duplicates are ignored | free |
 
-`k` = number of pending stops for that car, bounded by the number of floors, so in practice ≤ 100. Everything is effectively O(log F).
+`k` = number of pending stops, which can never be more than the number of floors.
 
-### 5.3 Elevator state machine
+**Example.** The car is at floor 3, going up. `upStops = {5, 9}`, `downStops = {2, 7}`.
 
 ```
-                    ┌──────────────┐
-       no stops     │     IDLE     │◄────────────── doors closed & no stops
-    ┌──────────────►└──────┬───────┘
-    │                      │ stop assigned
-    │                      ▼
-    │               ┌──────────────┐
-    │               │    MOVING    │  (one floor per tick, toward target)
-    │               └──────┬───────┘
-    │                      │ arrived at a requested floor
-    │                      ▼
-    │               ┌──────────────┐
-    │               │ DOORS_OPENING│
-    │               └──────┬───────┘
-    │                      ▼
-    │               ┌──────────────┐   obstruction / open button
-    │               │  DOORS_OPEN  │◄──────────┐  (reset dwell timer)
-    │               └──────┬───────┘           │
-    │                      │ dwell expired     │
-    │                      ▼                   │
-    │               ┌──────────────┐───────────┘
-    └───────────────│ DOORS_CLOSING│
-                    └──────────────┘
-
-  Any state ──emergency stop──► EMERGENCY_STOP ──reset──► IDLE
-  IDLE      ──service──────────► MAINTENANCE     ──release─► IDLE
-  Any state ──fire alarm───────► FIRE_SERVICE (recall to designated floor, doors open, stay)
+upStops.ceiling(3)  = 5    -> go to 5
+upStops.ceiling(5)  = 9    -> go to 9
+upStops.ceiling(9)  = null -> no more up stops, so turn around
+downStops.last()    = 7    -> start the down sweep at 7
+downStops.floor(7)  = 2    -> go to 2
 ```
 
-**Safety invariant, enforced in code, not in comments:**
+Notice that the car passes floor 7 on the way up **without stopping**, because the person at 7 wants to go *down*.
 
-```java
-// MOVING is unreachable unless door == CLOSED. There is no code path that moves
-// a car with the doors open, because moveOneFloor() asserts it.
+**Why two sets and not one?** Because of direction. A person at floor 7 going UP and a person at floor 7 going DOWN are two different stops, served on two different sweeps.
+
+### 5.4 Car state machine
+
+```
+                         ┌──────────┐
+         ┌──────────────►│   IDLE   │◄───────── doors closed, no stops left
+         │               └────┬─────┘
+         │                    │ got a stop (or a parking floor)
+         │                    ▼
+         │               ┌──────────┐
+         │               │  MOVING  │  one floor per tick
+         │               └────┬─────┘
+         │                    │ reached a floor it must stop at
+         │                    ▼
+         │               ┌──────────┐
+         └───────────────│ STOPPED  │  doors open → dwell → close
+          no stops left  └────┬─────┘
+                              │ doors closed, more stops
+                              └──────────► MOVING
+
+Special states (the car leaves normal dispatch):
+  any ──technician──► MAINTENANCE     ──release──► IDLE   (its hall calls go to other cars)
+  any ──e-stop──────► EMERGENCY_STOP  ──reset────► IDLE   (its hall calls go to other cars)
+  any ──fire alarm──► FIRE_SERVICE    drives to the fire floor, opens doors, stays there
 ```
 
-### 5.4 Request model
+### 5.5 Door state machine
 
-```java
-sealed interface Request
-    ├── HallCall(int floor, Direction direction, Instant placedAt)   // system-owned
-    └── CarCall(int carId, int floor, Instant placedAt)              // car-owned
+The door is its own small object with its own states:
+
+```
+ CLOSED ──open()──► OPENING ──1 tick──► OPEN ──dwell ticks──► CLOSING ──1 tick──► CLOSED
+                                         ▲                        │
+                                         └──── open() again ──────┘
+                                       (photo-eye, door-open button, overload)
 ```
 
-Modelling these as a **sealed interface** means the handler switch is exhaustive — you cannot add a third request type (e.g. `PriorityCall` for a firefighter key) without the compiler forcing you to handle it.
+With a 1-tick open, a 3-tick dwell and a 1-tick close, **one stop costs 5 ticks**. The dispatcher uses that number (`STOP_TICKS`) in its ETA estimate.
 
-### 5.5 Class diagram
+**The safety rule:** `ElevatorCar.tick()` checks `door.isClosed()` first. While the door is not closed, the only thing that can happen is the door moving. As a second layer of defence, `moveOneFloorToward()` throws an exception if it's ever called with the door open.
+
+### 5.6 Class diagram
 
 ```mermaid
 classDiagram
     class ElevatorSystem {
         -List~ElevatorCar~ cars
         -Dispatcher dispatcher
-        -TrafficMonitor monitor
-        -ParkingPolicy parking
-        +requestHallCall(int, Direction)
-        +requestCarCall(int, int)
+        -TrafficMonitor trafficMonitor
+        -ParkingPolicy parkingPolicy
+        -Map~HallCall,Long~ waitingSince
+        -Deque~HallCall~ unassigned
+        +requestHallCall(floor, Direction)
+        +requestCarCall(carId, floor)
         +tick()
+        +takeOutOfService(carId)
+        +fireAlarm(floor)
     }
-
     class ElevatorCar {
-        -int id
         -int currentFloor
-        -Direction committedDirection
+        -Direction direction
         -CarState state
-        -Door door
         -TreeSet~Integer~ upStops
         -TreeSet~Integer~ downStops
-        -int capacity
-        -int load
-        +addCarCall(int)
+        -Set~HallCall~ hallCalls
+        +addCarCall(floor)
         +addHallCall(HallCall)
-        +tick()
         +nextTarget() OptionalInt
-        +estimateTicksTo(int, Direction) long
-    }
-
-    class Dispatcher {
-        <<interface>>
-        +assign(HallCall, List~ElevatorCar~, TrafficMode) Optional~ElevatorCar~
-    }
-    class NearestCarDispatcher
-    class CostBasedDispatcher
-    class ZonedDispatcher
-
-    class TrafficMonitor {
-        +record(BoardingEvent)
-        +currentMode() TrafficMode
-    }
-    class ParkingPolicy {
-        <<interface>>
-        +parkingFloorFor(ElevatorCar, TrafficMode, List~ElevatorCar~) OptionalInt
+        +tick()
+        +estimateTicksTo(floor, Direction) int
+        +releaseAllStops() Set~HallCall~
     }
     class Door {
-        -DoorState state
-        -int dwellTicksRemaining
-        +open(int)
+        -State state
+        +open(dwellTicks)
         +tick()
         +isClosed() boolean
     }
+    class Dispatcher {
+        <<interface>>
+        +assign(HallCall, cars, TrafficMode) Optional~ElevatorCar~
+    }
+    class ParkingPolicy {
+        <<interface>>
+        +parkingFloorFor(car, cars, TrafficMode) OptionalInt
+    }
+    class TrafficMonitor {
+        +recordBoarding(tick, floor, people)
+        +evaluate(tick)
+        +mode() TrafficMode
+    }
+    class ElevatorController {
+        +pressHallButton(floor, Direction)
+        +pressCarButton(carId, floor)
+    }
 
+    ElevatorController --> ElevatorSystem : runs on one thread
     ElevatorSystem "1" *-- "many" ElevatorCar
     ElevatorSystem --> Dispatcher
-    ElevatorSystem --> TrafficMonitor
     ElevatorSystem --> ParkingPolicy
+    ElevatorSystem --> TrafficMonitor
     ElevatorCar "1" *-- "1" Door
     Dispatcher <|.. NearestCarDispatcher
     Dispatcher <|.. CostBasedDispatcher
     Dispatcher <|.. ZonedDispatcher
+    ParkingPolicy <|.. TrafficAwareParkingPolicy
 ```
+
+### 5.7 Design patterns used (interviewers often ask)
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Strategy** | `Dispatcher`, `ParkingPolicy` | Swap nearest-car ↔ cost-based ↔ zoned without touching the rest |
+| **Decorator** | `ZonedDispatcher` wraps another `Dispatcher` | Adds zoning on top of any dispatch strategy |
+| **State machine** | `CarState`, `Door.State` | Makes illegal moves (moving with the door open) impossible |
+| **Command queue / single-writer** | `ElevatorController` | All changes happen on one thread, so no locks are needed |
+| **Value object** | `HallCall`, `Building` records | Compared by value, so de-duplication is free |
+
+SOLID in one line each: the car only schedules and the dispatcher only assigns (**S**); new dispatchers need no changes to existing code (**O**); the system depends on the `Dispatcher` interface, not on a concrete class (**D**).
 
 ---
 
-## 6. Scheduling Algorithms
+## 6. Algorithms
 
-### 6.1 The per-car algorithm — know the family, pick LOOK
+### 6.1 One car: know the family, pick LOOK
 
-These are literally the disk-scheduling algorithms; say so, it lands well.
+These are the classic disk-scheduling algorithms. Saying so goes down well.
 
-| Algorithm | Rule | Verdict for elevators |
+| Algorithm | Rule | Good for elevators? |
 |---|---|---|
-| **FCFS** | Serve in arrival order | ❌ Terrible. Car yo-yos: 1 → 10 → 2 → 9. Passengers on floor 2 watch it pass twice. |
-| **SSTF** (nearest stop first) | Always go to the closest pending stop | ❌ **Starvation.** A busy lobby keeps the car near the bottom; floor 20 waits forever. |
-| **SCAN** ("elevator algorithm") | Sweep to the *physical end* of the shaft, reverse | ⚠️ Correct but wasteful — travels to floor 20 even if the highest request is floor 12. |
-| **LOOK** | Sweep only to the *highest/lowest requested* floor, then reverse | ✅ **This is the answer.** SCAN without the wasted travel. |
-| **C-SCAN / C-LOOK** | Always sweep in one direction, jump back to the start | ⚠️ Gives *uniform* wait times (good for disks, fair) but the empty return trip is unacceptable for people. |
+| **FCFS** | Serve in the order buttons were pressed | ❌ Car bounces around: 1 → 10 → 2 → 9 |
+| **SSTF** | Always go to the closest stop | ❌ **Starvation**: a busy lobby keeps the car low, floor 20 waits forever |
+| **SCAN** | Sweep to the *end of the shaft*, then turn around | ⚠️ Works, but wasteful: goes to floor 20 even if the highest request is 12 |
+| **LOOK** | Sweep to the *last requested floor*, then turn around | ✅ **The answer.** SCAN without the wasted travel |
+| **C-LOOK** | Always sweep up, then jump empty back to the bottom | ⚠️ Fair for disks, but an empty ride down is silly for people |
 
-**LOOK, in one sentence:** *keep going in the current direction, stopping at every requested floor on the way; when there are no more requests ahead, reverse.*
+**LOOK in one sentence:** *keep going in the current direction, stopping at every requested floor; when there's nothing left ahead, turn around.*
 
-Why it's the right answer:
+### 6.2 LOOK as three rules (this is exactly what the code does)
 
-- **No starvation** — a sweep is guaranteed to reach every requested floor in that direction.
-- **Passenger-intuitive** — matches what people expect a lift to do.
-- **Directionally correct** — a DOWN hall call is only served by a car in (or entering) its DOWN phase, so nobody gets carried the wrong way.
-- **Cheap** — O(log k) per decision with two `TreeSet`s.
+When the car is going **UP**:
 
-```
-LOOK trace, car at floor 3 moving UP, stops {5, 9} up and {7, 2} down:
+1. Is there an UP stop at or above me? → go to the nearest one. *(normal case)*
+2. No? Are there any DOWN stops? → go to the **highest** one. That's where the down sweep starts. It may be above me (I keep climbing) or below me (I turn around now).
+3. No DOWN stops either? Then only UP stops below me are left → go to the **lowest** one and start a new up sweep.
 
- 3 ──► 5 (up call served)  ──► 9 (up call served, no more up stops)
-   reverse at 9
- 9 ──► 7 (down call served) ──► 2 (down call served) ──► IDLE
+Going **DOWN** is the mirror image. A car that was **IDLE** just goes to its nearest stop.
 
-SCAN would have continued 9 → 20 (top of shaft) before reversing. Wasted travel.
-SSTF from 3 would go 3 → 2 → 5 → 7 → 9 — and if new low calls keep arriving,
-floor 9 never gets served.
-```
+When the car arrives at a floor, it serves the stop that **matches its direction** first. If there's no match, it's at a turnaround point, so it serves the other direction and flips. The arrow it leaves with is shown on the hall lantern.
 
-### 6.2 The multi-car problem — dispatch
+Why LOOK is the right answer:
 
-Now: **which** car gets the hall call? Three levels of answer, give all three.
+- **No starvation.** Every sweep is at most one shaft long, so every stop is reached within about one round trip.
+- **Feels natural.** It's what passengers expect a lift to do.
+- **Never goes the wrong way.** A DOWN call is only served while the car is heading down.
+- **Cheap.** Each decision is O(log k).
 
-#### Level 1 — Nearest car (baseline, name its flaw)
+### 6.3 Many cars: which car gets the hall call?
 
-```java
-argmin over cars of |car.currentFloor - call.floor|
-```
+Explain this as levels.
 
-Simple, and **wrong often enough to matter**: it ignores direction and existing load. A car 1 floor away but travelling the opposite direction with 8 stops queued is worse than an idle car 4 floors away. Present this as the baseline you're about to improve.
+#### Level 1 — Nearest car (the baseline, and why it's not enough)
 
-#### Level 2 — Cost / ETA-based dispatch ✅ (the answer to give)
+"Send the car that is physically closest." Simple, but it **ignores direction and how busy the car is**. A car one floor away that's heading the other way with a full queue is worse than an idle car four floors away. Present it, then improve on it.
 
-Score every eligible car with an estimated time-to-arrival plus penalties, take the min. This is what real group controllers do (Otis calls it "relative system response", Mitsubishi/KONE use variations).
+#### Level 2 — Cost / ETA-based ✅ (the answer to give)
+
+Score every car that is *allowed* to take the call, and pick the lowest score:
 
 ```
-cost(car, call) =
-      estimatedTicksToReach(car, call.floor, call.direction)   // travel + intermediate stops
-    + α × car.pendingStopCount                                 // load balancing
-    + β × car.load / car.capacity                              // crowding penalty
-    + γ × directionMismatchPenalty(car, call)                  // wrong-way penalty
-    − δ × callAge                                              // anti-starvation
-    + ∞  if !car.canServe(call)                                // eligibility gate
+cost(car) =  ETA(car → caller)              how many ticks until it can open its doors there
+          +  2 × car.pendingStopCount       spread work across the fleet
+          +  8 × car.loadRatio              prefer emptier cars (load / capacity, 0.0 to 1.0)
+          +  peak-hour rule                 up-peak: don't pull an idle car away from the lobby
+
+Not allowed at all (skipped):  out of service, full, or doesn't serve that floor
 ```
 
-The ETA function is the interesting part — it must respect LOOK:
+There's no separate "wrong direction" penalty, because the ETA already includes the detour a wrong-way car has to make. Adding a penalty on top would count it twice.
 
-```
-Case A: car is IDLE
-        eta = |cur - f| × TRAVEL_TICKS
+Real group controllers work like this (Otis calls it "relative system response"). The weights 2 and 8 are tuning knobs. In real life you tune them with a simulation (§9.4).
 
-Case B: car is moving in the SAME direction as the call and the call floor is AHEAD
-        eta = |cur - f| × TRAVEL_TICKS + stopsBetween(cur, f) × STOP_TICKS
-        ← the "free ride" case; this is what makes collective control efficient
+#### Level 3 — Zoning (tall buildings)
 
-Case C: car is moving in the same direction but the call floor is BEHIND
-        eta = distance to its reversal point, then back down to f  (two legs)
+Split the floors into bands (1–15, 16–30, …) and give each band its own cars. Each car makes fewer stops per trip, so round trips get much shorter. `ZonedDispatcher` wraps the cost-based dispatcher: it only narrows down the list of cars. If every car in a zone is busy or broken, it falls back to any car. Very tall buildings add **sky lobbies** with express cars.
 
-Case D: car is moving in the OPPOSITE direction
-        eta = distance to reversal, reverse, then to f            (two legs)
-```
+#### Level 4 — Destination dispatch (the modern answer, worth 2 minutes)
 
-**Case B is the whole point.** A car already sweeping up past floor 7 should absorb a new UP call at floor 9 for almost zero marginal cost. Nearest-car scoring misses this; ETA scoring captures it.
+Passengers type their **destination** on a keypad in the lobby, instead of pressing UP or DOWN. The system groups people going to similar floors into the same car.
 
-#### Level 3 — Destination dispatch (the modern answer, worth mentioning)
-
-Passengers enter their **destination floor** in the lobby (keypad/turnstile) rather than just a direction. The controller then groups passengers with common destinations into the same car.
-
-| | Conventional | Destination dispatch |
+| | Up/down buttons | Destination dispatch |
 |---|---|---|
-| Hall input | direction only | exact destination |
-| Grouping | none | passengers batched by destination |
-| Stops per trip | high | much lower |
-| Handling capacity | baseline | **+20–30%** typical |
-| Downside | — | needs kiosks; confusing for visitors; harder with luggage/crowds |
+| What the hall button tells us | direction only | the exact destination |
+| Stops per trip | many | far fewer (passengers are grouped) |
+| Handling capacity | baseline | typically +20–30% |
+| Downsides | — | needs keypads; confuses visitors |
 
-Say: *"If we control the hall interface, destination dispatch is strictly better for up-peak because it lets us bin passengers by destination and cut stops per round trip. It's the standard in new high-rises."*
+Line to say: *"If we control the lobby hardware, destination dispatch is better, especially in up-peak, because we can group passengers by destination. New tall buildings use it."*
 
-#### Level 4 — Zoning (for tall buildings)
+### 6.4 The ETA estimate: four cases
 
-Split floors into zones (1–10, 11–20, 21–30) and dedicate cars per zone; or use **sky lobbies** with express cars. Reduces round-trip time drastically above ~25 floors. Mention it as the answer to *"what if it's a 60-storey tower?"*
+This is the heart of cost-based dispatch. The ETA has to follow LOOK, because that's how the car will really move.
 
-### 6.3 Algorithm summary table
+```
+Case A — car is IDLE
+         ETA = distance × 1 tick
 
-| Layer | Problem | Algorithm | Complexity |
+Case B — car is heading TOWARD the caller, in the SAME direction the caller wants   ← the "free ride"
+         ETA = distance + (stops on the way × 5 ticks)
+
+         floor 9  ● caller wants UP
+         floor 7  ○ existing stop           ETA = 6 floors + 1 stop × 5 = 11
+         floor 3  ▲ car going UP
+
+Cases C & D — car must finish its sweep and turn around first
+         (caller is behind it, or wants the other direction)
+         ETA = (distance to turnaround + stops on the way + 1 stop at the turnaround)
+             + distance from turnaround back to the caller
+
+         floor 15 ○ car's last stop (turnaround)
+         floor 12 ○ stop
+         floor 8  ● caller wants DOWN       ETA = (8 + 5 + 5) + 7 = 25
+         floor 7  ▲ car going UP
+```
+
+**Case B is the whole point.** A car already travelling up past floor 7 can pick up an UP caller at floor 9 almost for free. Nearest-car dispatch can't see this; ETA-based dispatch can.
+
+It's only an **estimate**: it ignores calls that haven't been pressed yet, and the time left on doors that are currently open. That's fine. It only has to rank cars correctly.
+
+### 6.5 Can anyone wait forever? (starvation)
+
+A common answer is "subtract the call's age from the cost so old calls win". **That does nothing in this design**, for two reasons:
+
+1. When the dispatcher scores cars for *one* call, that call's age is the same for every car. Subtracting the same number from every score doesn't change which car wins.
+2. Calls are assigned the moment they're pressed, so their age is about 0 anyway.
+
+What actually prevents starvation:
+
+| Risk | What handles it |
+|---|---|
+| A stop never reached by its car | **LOOK.** A sweep is at most one shaft long, so a stop is reached within about one round trip (≈ 2 × floors × travel + stops × 5 ticks). |
+| A call nobody picks up | **Every call is assigned immediately.** If no car can take it (all full or broken), it goes into the `unassigned` queue and is retried every tick, oldest first. It's never dropped. |
+| A car breaks after taking a call | `takeOutOfService` / `emergencyStop` hand its hall calls to other cars. The lamp stays lit and the wait time keeps counting. |
+| The assigned car gets slow (doors held, fills up) | **Re-dispatch (extension).** Every few seconds, re-score calls that have been waiting longer than some threshold. If another car is now much better, move the call. *This* is where call age really belongs: as the trigger for re-checking, not as a term in the cost. |
+
+Interview line: **"LOOK guarantees no starvation inside one car. Immediate assignment plus re-dispatch guarantees it across cars."**
+
+### 6.6 Summary
+
+| Layer | Problem | Algorithm | Cost |
 |---|---|---|---|
-| Per car | Stop ordering | **LOOK** with two `TreeSet`s | O(log k) per decision |
-| Group | Hall-call assignment | **Cost/ETA-based** with penalties | O(N log k) per call |
-| Group | Tall buildings | **Zoning** / sky lobbies | O(1) zone lookup + O(N_zone log k) |
-| Group | Modern hall interface | **Destination dispatch** (bin packing by destination) | greedy O(N × k) |
-| Group | Idle behaviour | **Parking / homing** by traffic mode | O(N) |
+| One car | Stop order | LOOK with two `TreeSet`s | O(log k) per decision |
+| Group | Which car | Cost/ETA-based | O(N · k) per call |
+| Group | Tall buildings | Zoning (wraps cost-based) | + O(zones) |
+| Group | Modern lobby | Destination dispatch | greedy grouping |
+| Group | Idle cars | Parking by traffic mode | O(N log N) per tick |
 
 ---
 
-## 7. Request Processing & Peak Periods
+## 7. How Requests Flow & Peak Periods
 
-### 7.1 Processing a hall call
+### 7.1 A hall call, step by step
 
 ```
-requestHallCall(floor, dir)
-   1. Deduplicate  → if this (floor, dir) is already assigned & lit, ignore.
-                     Two people pressing UP is ONE call, not two.
-   2. Eligibility  → filter cars: servesFloor, not MAINTENANCE / FIRE_SERVICE, not full.
-   3. Score        → cost(car, call) for each eligible car.
-   4. Assign       → min cost; tie-break by lowest id for determinism.
-   5. Enqueue      → dir == UP  ? car.upStops.add(floor)
-                                : car.downStops.add(floor)
-   6. Light lamp   → hallPanel.light(floor, dir); cleared when a car opens doors
-                     there while committed to that direction.
-   7. If no car eligible → park in a pending queue, retried every tick
-                            (a car may free up).
+requestHallCall(floor, direction)
+  1. Validate      - floor exists; no UP button on the top floor, no DOWN on the bottom.
+  2. De-duplicate  - lamp already lit for (floor, direction)? Ignore. Two presses = one call.
+  3. Light lamp    - waitingSince[(floor, direction)] = now
+  4. Dispatch      - dispatcher.assign(call, cars, mode)
+  5a. Got a car    - car.addHallCall(call): UP → upStops, DOWN → downStops
+  5b. No car       - add to the unassigned queue; retried every tick
+  ...later...
+  6. Lamp off      - a car has its doors open at this floor AND is going this direction.
+                     Record the wait time (now - waitingSince) for the stats.
 ```
 
-### 7.2 Processing a car call
+```mermaid
+sequenceDiagram
+    participant P as Passenger
+    participant S as ElevatorSystem
+    participant D as CostBasedDispatcher
+    participant C as ElevatorCar
+    P->>S: requestHallCall(8, DOWN)
+    S->>S: already lit? no → light lamp, remember tick
+    S->>D: assign(call, cars, mode)
+    D->>C: estimateTicksTo(8, DOWN) for each car
+    D-->>S: cheapest car
+    S->>C: addHallCall(8, DOWN) → downStops
+    loop every tick
+        S->>C: tick()  (LOOK decides where to go)
+    end
+    C->>C: arrives at 8 going DOWN, opens doors
+    S->>S: lamp (8, DOWN) off, record wait time
+```
 
-Much simpler — **no dispatch decision exists**, the passenger is already inside:
+### 7.2 A car call
+
+Much simpler, because **there's no dispatch decision**. The passenger is already inside.
 
 ```
 requestCarCall(carId, floor)
-   1. Validate      → car.servesFloor(floor); reject with a beep otherwise.
-   2. Route by side → floor > current ? upStops.add : (floor < current ? downStops.add : openDoors())
-   3. Light the in-car button.
+  1. Car out of service, or doesn't serve that floor? → beep and ignore.
+  2. floor above the car → upStops;  floor below → downStops;  same floor → just open the doors.
 ```
 
-> **Subtlety worth calling out:** a car call *below* a car that is currently committed UP goes into `downStops`, and will be served on the reverse sweep. That's correct LOOK behaviour and matches what real lifts do.
+> **Subtle point:** a car going UP gets a car call for a floor *below* it. That goes into `downStops` and is served on the way back down. That's correct LOOK behaviour, and it's what real lifts do.
 
-### 7.3 The tick loop (one car)
+### 7.3 One tick of one car
 
 ```
 tick():
-  if state == MAINTENANCE | FIRE_SERVICE | EMERGENCY_STOP → do nothing
-  if door is not CLOSED       → door.tick(); return          ← SAFETY: never move
-  target = nextTarget()                                       ← LOOK decision
-  if target is empty          → state = IDLE; maybeMoveToParkingFloor(); return
-  if target == currentFloor   → serveFloor(); return          ← removes stop, opens door
-  currentFloor += signum(target - currentFloor)               ← one floor per tick
-  committedDirection = signum(...)
-  state = MOVING
+  MAINTENANCE / EMERGENCY_STOP        → do nothing
+  FIRE_SERVICE                        → drive to the fire floor, open doors, stay
+  door not closed                     → only move the door        ← SAFETY RULE
+                                        (overloaded? keep it open)
+  no target (no stops, no parking)    → IDLE
+  target is another floor             → move one floor toward it
+  now on the target floor             → serve the stop, open the doors
 ```
 
-Every branch is one line, which is exactly the point: the complexity lives in `nextTarget()` (LOOK) and in the dispatcher (cost), not in the loop.
+Each branch is short on purpose. The hard thinking lives in `nextTarget()` (LOOK) and in the dispatcher (cost), not in the loop.
 
-### 7.4 Peak periods — the part most candidates skip
+### 7.4 One tick of the whole system
 
-Traffic is not uniform. Four canonical patterns:
+```
+ElevatorSystem.tick():
+  1. now++
+  2. retry unassigned hall calls
+  3. tick every car
+  4. switch off lamps for calls that were just answered
+  5. every 300 ticks: trafficMonitor.evaluate()
+  6. update parking floors for idle cars
+```
 
-| Mode | When | Traffic shape | Strategy |
+### 7.5 Peak periods (the part most candidates skip)
+
+Traffic is not the same all day. There are five patterns:
+
+| Mode | Typical time | What's happening | Strategy |
 |---|---|---|---|
-| **UP_PEAK** | 08:00–09:30 | Everyone enters at the lobby, goes up | **Park idle cars at the lobby.** Return empties to the lobby immediately (don't wait for a call). Consider "sectoring": each car serves a contiguous band of upper floors so it makes fewer stops per trip. |
-| **DOWN_PEAK** | 17:00–18:30 | Everyone descends to the lobby | **Distribute idle cars across upper floors**, not the lobby. A car arriving at the lobby should immediately head back up. Bias the cost function toward DOWN calls. |
-| **LUNCH / two-way** | 12:00–14:00 | Heavy both directions, lobby-centric | Hardest case. Split the fleet: some cars home to the lobby, some to mid-building. Avoid all cars converging. |
-| **OFF_PEAK / interfloor** | rest of day | Sparse, random | Park cars **spread evenly** across the shaft to minimise expected distance to a random call. For N cars and F floors: park at `F × (2i + 1) / (2N)`. |
+| **UP_PEAK** | morning | Everyone comes in at the lobby and goes up | **Park idle cars at the lobby**, keep one mid-building. Make it costly to pull a lobby car away for other calls. |
+| **DOWN_PEAK** | evening | Everyone goes down to the lobby | **Spread idle cars over the upper half**, so a DOWN press upstairs is answered fast. |
+| **LUNCH** | midday | Heavy traffic both to and from the lobby | Half the cars wait at the lobby, the other half spread above it. |
+| **NORMAL** | rest of the day | Busy, but random floor-to-floor | Spread cars evenly over the building. |
+| **OFF_PEAK** | night / weekend | Very little traffic | Same as NORMAL (spread evenly). |
+
+**Spreading evenly:** cut the floor range into N equal bands and park each car in the middle of its band. For 3 cars on floors 0–20, that's floors **3, 10, 16**. Any random call is then close to some car.
 
 #### How to detect the mode
 
-Do **not** hard-code clock times — buildings differ, and interviewers will ask "what about a hospital?". Detect it from observed traffic over a sliding window:
+**Don't hard-code clock times.** Buildings are different; a hospital or a hotel doesn't follow office hours. Look at what passengers actually do over the last 5 minutes:
 
 ```
-lobbyBoardings   = passengers boarding at the main floor  (last 5 min)
-lobbyAlightings  = passengers exiting at the main floor   (last 5 min)
-total            = all boardings
+startAtLobby = people who BOARDED at the lobby   / all people who boarded
+endAtLobby   = people who GOT OFF at the lobby   / all people who got off
 
-if lobbyBoardings  / total > 0.60  → UP_PEAK
-if lobbyAlightings / total > 0.60  → DOWN_PEAK
-if both > 0.30                     → LUNCH
-else                               → OFF_PEAK / NORMAL
+fewer than 10 boardings               → OFF_PEAK
+startAtLobby > 60%                    → UP_PEAK
+endAtLobby   > 60%                    → DOWN_PEAK
+both > 30%                            → LUNCH
+otherwise                             → NORMAL
 ```
 
-Use hysteresis (require the condition to hold for ~2 consecutive windows) so the system doesn't flap between modes.
+> ⚠️ Compare boardings with boardings, and drop-offs with drop-offs. If you divide lobby boardings by *all events* (boardings + drop-offs), every trip is counted twice. The share can then never go above 50%, and up-peak is never detected. The previous version of these notes had exactly this bug.
 
-#### Other peak-period levers
+**Hysteresis:** only switch mode after the *same* new result shows up in **2 checks in a row**. The monitor checks once per window, not every time someone reads the mode, so one noisy window can't flip the whole building.
 
-- **Sectoring during up-peak:** assign each car a contiguous band of floors so a full car makes 3 stops instead of 8. Round-trip time drops sharply.
-- **Load-based departure:** during up-peak, dispatch a car from the lobby when it hits ~80% load *or* a dwell timeout, rather than on a fixed timer.
-- **Skip full cars:** a car at capacity must stop accepting hall calls (its car calls still stand). Otherwise it stops, nobody can board, and everyone loses.
-- **Anti-nuisance:** if a car's load is low but many car calls are registered (kids pressing every button), cancel car calls on an empty-car detection.
-- **Bunching:** cars naturally clump together (the same reason buses bunch). Counter it with a dispersion term in the cost function — penalise assigning a call to a car that's near another car.
+#### Other rush-hour tools
+
+- **Skip full cars.** A full car takes no new hall calls. Otherwise it stops at floor 3 where nobody can get in.
+- **Overload.** If the load sensor reads over capacity, the doors won't close (buzzer) until someone steps out.
+- **Sectoring in up-peak.** Give each car a band of upper floors, so a full car makes 3 stops instead of 8.
+- **Load-based departure.** In up-peak, send the lobby car off when it's ~80% full or a timer runs out.
+- **Anti-nuisance.** Load is almost zero but 10 car calls are registered (someone pressed every button)? Cancel them.
+- **Bunching.** Cars tend to clump together, like buses. Spreading parked cars helps. You can also add a small penalty for picking a car that's right next to another car.
 
 ---
 
 ## 8. The Code
 
-> Java 17+. Discrete-tick simulation: **1 tick = 1 floor of travel**, doors take a few ticks. No `Thread.sleep` anywhere in the domain — that's what makes it unit-testable.
+> Java 17+. **1 tick = time to travel one floor.** Time is a simple counter, so there's no `Thread.sleep` and no wall clock in the domain code, and every test is deterministic.
+>
+> All of this code has been compiled and run. The walkthroughs in §9 show its real output.
 
-### 8.1 Enums and value objects
+### 8.0 Reading order
+
+| # | File | What it is | Read it for |
+|---|---|---|---|
+| 1 | `Direction`, `CarState`, `TrafficMode`, `Building`, `HallCall` | Small types | Vocabulary |
+| 2 | `Door` | Door state machine | The safety rule |
+| 3 | `ElevatorCar` | One car | **LOOK** + ETA (the most important file) |
+| 4 | `Dispatcher` + 3 implementations | Which car | **Cost function** |
+| 5 | `TrafficMonitor` | Rush-hour detection | Peak handling |
+| 6 | `TrafficAwareParkingPolicy` | Where idle cars wait | Peak handling |
+| 7 | `ElevatorSystem` | The group controller | How everything connects |
+| 8 | `ElevatorController` | Threading | Concurrency |
+
+All classes live in `package com.building.elevator;`. The package and import lines are left out below unless they matter.
+
+### 8.1 Small types
 
 ```java
 // Direction.java
-package com.building.elevator;
-
 public enum Direction {
-    UP(1), DOWN(-1), IDLE(0);
+    UP, DOWN, IDLE;
 
-    private final int step;
-
-    Direction(int step) { this.step = step; }
-
-    public int step() { return step; }
-
-    public Direction opposite() {
-        return switch (this) {
-            case UP -> DOWN;
-            case DOWN -> UP;
-            case IDLE -> IDLE;
-        };
-    }
-
+    /** +3 -> UP, -2 -> DOWN, 0 -> IDLE */
     public static Direction of(int delta) {
-        return delta > 0 ? UP : delta < 0 ? DOWN : IDLE;
+        if (delta > 0) return UP;
+        if (delta < 0) return DOWN;
+        return IDLE;
     }
 }
 ```
 
 ```java
 // CarState.java
-package com.building.elevator;
-
 public enum CarState {
-    IDLE,            // doors closed, no pending stops
-    MOVING,          // between floors
-    STOPPED,         // at a floor, doors cycling
-    MAINTENANCE,     // taken out of the group by a technician
-    FIRE_SERVICE,    // recalled to the designated floor, group control suspended
-    EMERGENCY_STOP;  // e-stop pulled
+    IDLE,            // doors closed, nothing to do
+    MOVING,          // travelling between floors
+    STOPPED,         // at a floor, doors opening / open / closing
+    MAINTENANCE,     // taken out of service by a technician
+    EMERGENCY_STOP,  // e-stop pressed / fault detected
+    FIRE_SERVICE;    // fire alarm: recalled to the fire floor
 
-    /** A car in one of these states must be excluded from dispatch. */
-    public boolean isAvailableForDispatch() {
+    /** Only these states take part in normal dispatch. */
+    public boolean isInService() {
         return this == IDLE || this == MOVING || this == STOPPED;
     }
 }
 ```
 
 ```java
-// DoorState.java
-package com.building.elevator;
-
-public enum DoorState { CLOSED, OPENING, OPEN, CLOSING }
+// TrafficMode.java
+public enum TrafficMode {
+    OFF_PEAK,   // very little traffic (nights, weekends)
+    NORMAL,     // busy, but no dominant pattern
+    UP_PEAK,    // morning: most trips START at the lobby
+    DOWN_PEAK,  // evening: most trips END at the lobby
+    LUNCH       // heavy traffic both to and from the lobby
+}
 ```
+
+```java
+// Building.java
+/** Floors can be negative (basements). The lobby is usually 0 but doesn't have to be. */
+public record Building(int minFloor, int maxFloor, int lobbyFloor) {
+
+    public Building {
+        if (minFloor >= maxFloor) throw new IllegalArgumentException("need at least 2 floors");
+        if (!(lobbyFloor >= minFloor && lobbyFloor <= maxFloor)) {
+            throw new IllegalArgumentException("lobby must be inside the building");
+        }
+    }
+
+    public boolean hasFloor(int floor) { return floor >= minFloor && floor <= maxFloor; }
+
+    public int middleFloor() { return minFloor + (maxFloor - minFloor) / 2; }
+}
+```
+
+```java
+// HallCall.java
+/**
+ * A button pressed OUTSIDE the car, in the lift lobby of a floor.
+ *
+ * It carries a DIRECTION, not a destination. That is the key modelling detail.
+ * Two people pressing UP on floor 7 create the SAME HallCall (records compare by value),
+ * so de-duplication is free.
+ */
+public record HallCall(int floor, Direction direction) {
+    public HallCall {
+        if (direction == Direction.IDLE) {
+            throw new IllegalArgumentException("a hall call is either UP or DOWN");
+        }
+    }
+}
+```
+
+### 8.2 `Door`
 
 ```java
 // Door.java
-package com.building.elevator;
-
 /**
- * Doors are a separate object with their own timing because the SAFETY INVARIANT
- * "the car must not move unless door.isClosed()" needs a single, unambiguous
- * source of truth. Inlining a boolean into ElevatorCar is how you get bugs that
- * kill people.
+ * The door is its own small state machine:  CLOSED -> OPENING -> OPEN -> CLOSING -> CLOSED
+ *
+ * It is a separate class because the most important safety rule in the system
+ * ("the car never moves unless the door is CLOSED") needs ONE clear source of truth.
  */
 public final class Door {
 
-    private static final int TRANSITION_TICKS = 1;
+    public enum State { CLOSED, OPENING, OPEN, CLOSING }
 
-    private DoorState state = DoorState.CLOSED;
-    private int ticksRemaining = 0;
-    private int dwellTicks = 0;
+    private static final int OPEN_CLOSE_TICKS = 1;   // time for the panels to slide
 
-    /** Begin an open/dwell/close cycle. */
-    public void openFor(int dwell) {
-        this.dwellTicks = dwell;
-        this.state = DoorState.OPENING;
-        this.ticksRemaining = TRANSITION_TICKS;
+    private State state = State.CLOSED;
+    private int ticksLeftInState = 0;
+    private int dwellTicks = 0;         // how long to stay OPEN
+    private boolean heldOpen = false;   // fire service: stay open until released
+
+    /**
+     * Open the door (or keep it open longer if it's already open / closing).
+     * The photo-eye, the "door open" button and a new arrival all call this.
+     */
+    public void open(int dwellTicks) {
+        this.dwellTicks = dwellTicks;
+        switch (state) {
+            case CLOSED -> { state = State.OPENING; ticksLeftInState = OPEN_CLOSE_TICKS; }
+            case OPENING -> { /* already on its way */ }
+            case OPEN, CLOSING -> { state = State.OPEN; ticksLeftInState = dwellTicks; }
+        }
     }
 
-    /** Photo-eye / door-open button: restart the dwell, never slam on a passenger. */
-    public void reopen() {
-        if (state == DoorState.CLOSING || state == DoorState.OPEN) {
-            state = DoorState.OPEN;
-            ticksRemaining = dwellTicks;
-        }
+    /** Fire service: open and stay open. */
+    public void holdOpen() {
+        state = State.OPEN;
+        heldOpen = true;
     }
 
     public void tick() {
-        if (ticksRemaining > 0) {
-            ticksRemaining--;
-            return;
+        if (heldOpen || state == State.CLOSED) return;
+
+        ticksLeftInState--;
+        if (ticksLeftInState > 0) return;          // still busy in the current state
+
+        switch (state) {
+            case OPENING -> { state = State.OPEN;    ticksLeftInState = dwellTicks; }
+            case OPEN    -> { state = State.CLOSING; ticksLeftInState = OPEN_CLOSE_TICKS; }
+            case CLOSING -> state = State.CLOSED;
+            case CLOSED  -> { }
         }
-        state = switch (state) {
-            case OPENING -> { ticksRemaining = dwellTicks; yield DoorState.OPEN; }
-            case OPEN    -> { ticksRemaining = TRANSITION_TICKS; yield DoorState.CLOSING; }
-            case CLOSING -> DoorState.CLOSED;
-            case CLOSED  -> DoorState.CLOSED;
-        };
     }
 
-    public boolean isClosed() { return state == DoorState.CLOSED; }
-    public DoorState state()  { return state; }
+    public boolean isClosed()   { return state == State.CLOSED; }
+    public boolean isHeldOpen() { return heldOpen; }
+    public State state()        { return state; }
 }
 ```
 
-```java
-// Request.java
-package com.building.elevator;
+### 8.3 `ElevatorCar` — LOOK lives here
 
-import java.time.Instant;
+This is the most important class, so it's shown in parts with an explanation before each one. Put together, it's a single file.
 
-/**
- * Sealed: a new request type (e.g. a firefighter priority call) becomes a compile
- * error everywhere it must be handled, instead of a silently-ignored case.
- */
-public sealed interface Request {
-
-    Instant placedAt();
-
-    /**
-     * Pressed OUTSIDE the car. Carries a DIRECTION, not a destination — this is the
-     * modelling detail that most candidates get wrong. Any car may serve it.
-     */
-    record HallCall(int floor, Direction direction, Instant placedAt) implements Request {
-        public HallCall {
-            if (direction == Direction.IDLE) {
-                throw new IllegalArgumentException("a hall call must be UP or DOWN");
-            }
-        }
-        /** Identity ignores time: two people pressing UP on floor 7 is ONE call. */
-        public String key() { return floor + ":" + direction; }
-    }
-
-    /** Pressed INSIDE the car. Bound to that car forever — never reassigned. */
-    record CarCall(int carId, int floor, Instant placedAt) implements Request {}
-}
-```
-
-### 8.2 `ElevatorCar` — the LOOK algorithm lives here
+**Part 0 — fields.** Look at the two `TreeSet`s and the `hallCalls` set. Those are the car's whole "to-do list".
 
 ```java
-// ElevatorCar.java
-package com.building.elevator;
-
-import java.util.HashSet;
-import java.util.Objects;
-import java.util.OptionalInt;
-import java.util.Set;
-import java.util.TreeSet;
-
+// ElevatorCar.java  (part 0 of 5)
 public final class ElevatorCar {
 
-    // --- tunables (a real system derives these from the drive's kinematics) ---
-    public static final int TRAVEL_TICKS_PER_FLOOR = 1;
-    public static final int STOP_PENALTY_TICKS     = 3;   // decel + doors + accel
-    public static final int REVERSAL_PENALTY_TICKS = 2;
-    public static final int DWELL_CAR_CALL_TICKS   = 3;
-    public static final int DWELL_HALL_CALL_TICKS  = 5;   // people walk to the car
+    // ---- timing, in ticks (1 tick = time to travel one floor) ----------------
+    public static final int TICKS_PER_FLOOR = 1;
+    public static final int DWELL_TICKS     = 3;   // how long doors stay fully open
+    public static final int STOP_TICKS      = 5;   // one full stop: open(1) + dwell(3) + close(1)
 
+    // ---- fixed facts about this car ------------------------------------------
     private final int id;
-    private final int minFloor;
-    private final int maxFloor;
+    private final Building building;
     private final int capacity;
-    private final Set<Integer> unservedFloors;   // express cars / restricted floors
+    private final Set<Integer> skippedFloors;   // express cars / restricted floors
 
+    // ---- live state ----------------------------------------------------------
     private int currentFloor;
-    private Direction committedDirection = Direction.IDLE;
+    private Direction direction = Direction.IDLE;
     private CarState state = CarState.IDLE;
-    private int load;
-
+    private int load = 0;
     private final Door door = new Door();
 
-    /**
-     * THE core data structure. Two ordered sets instead of one priority queue:
-     *   - upStops:   floors to stop at while travelling UP
-     *   - downStops: floors to stop at while travelling DOWN
-     * This makes "next stop in my current direction" a single O(log k) ceiling()/floor()
-     * call, and de-duplicates repeated presses for free.
-     */
-    private final TreeSet<Integer> upStops   = new TreeSet<>();
-    private final TreeSet<Integer> downStops = new TreeSet<>();
+    // ---- the work queue: WHERE this car must stop ----------------------------
+    private final TreeSet<Integer> upStops   = new TreeSet<>();  // serve while going UP
+    private final TreeSet<Integer> downStops = new TreeSet<>();  // serve while going DOWN
 
-    /** Soft target for idle parking. Always yields to a real call. */
-    private Integer parkingTarget;
+    /** Which of those stops came from hall buttons (so we can hand them back if we break down). */
+    private final Set<HallCall> hallCalls = new HashSet<>();
 
-    public ElevatorCar(int id, int minFloor, int maxFloor, int capacity) {
-        this(id, minFloor, maxFloor, capacity, Set.of());
+    /** Where to wait when there is no work. Any real call overrides it. */
+    private Integer parkingFloor = null;
+
+    /** Fire service: the floor this car is recalled to. */
+    private int fireRecallFloor;
+
+    public ElevatorCar(int id, Building building, int capacity) {
+        this(id, building, capacity, Set.of());
     }
 
-    public ElevatorCar(int id, int minFloor, int maxFloor, int capacity,
-                       Set<Integer> unservedFloors) {
+    public ElevatorCar(int id, Building building, int capacity, Set<Integer> skippedFloors) {
         this.id = id;
-        this.minFloor = minFloor;
-        this.maxFloor = maxFloor;
+        this.building = building;
         this.capacity = capacity;
-        this.unservedFloors = new HashSet<>(unservedFloors);
-        this.currentFloor = minFloor;
+        this.skippedFloors = Set.copyOf(skippedFloors);
+        this.currentFloor = building.lobbyFloor();
     }
+```
 
-    // =====================================================================
-    //  ACCEPTING WORK
-    // =====================================================================
+**Part 1 — accepting work.** A car call is placed by which side of the car it's on. A hall call is placed by its **direction**. That difference is the key modelling point from §4.
 
-    /** Car call: the passenger is already inside, so there is no dispatch decision. */
+```java
+// ElevatorCar.java  (part 1 of 5)
+    // =========================================================================
+    //  1. ACCEPTING WORK
+    // =========================================================================
+
+    /** Button pressed INSIDE the car. No dispatch decision: the rider is already here. */
     public void addCarCall(int floor) {
-        requireServable(floor);
-        if (floor > currentFloor)      upStops.add(floor);
-        else if (floor < currentFloor) downStops.add(floor);
-        else                           door.openFor(DWELL_CAR_CALL_TICKS);   // already here
-        parkingTarget = null;   // a real call always beats parking
+        requireServes(floor);
+        if (floor == currentFloor) {
+            if (state != CarState.MOVING) door.open(DWELL_TICKS);  // "open here" - just open
+            return;
+        }
+        // Put the stop on the side of the car it's on. LOOK will reach it in order.
+        if (floor > currentFloor) upStops.add(floor);
+        else                      downStops.add(floor);
+        parkingFloor = null;
     }
 
     /**
-     * Hall call, already assigned to this car by the Dispatcher. The call's DIRECTION
-     * decides which sweep serves it — that is what stops a DOWN passenger from being
-     * scooped up by an upward-bound car.
+     * Hall call that the Dispatcher gave to THIS car.
+     * The call's DIRECTION decides the list - so a DOWN passenger is only picked up
+     * when the car is heading DOWN, never carried the wrong way.
      */
-    public void addHallCall(Request.HallCall call) {
-        requireServable(call.floor());
+    public void addHallCall(HallCall call) {
+        requireServes(call.floor());
         if (call.direction() == Direction.UP) upStops.add(call.floor());
         else                                  downStops.add(call.floor());
-        parkingTarget = null;
+        hallCalls.add(call);
+        parkingFloor = null;
     }
 
-    public void setParkingTarget(Integer floor) {
-        if (hasPendingStops()) return;          // never park while work is pending
-        this.parkingTarget = floor;
-    }
-
-    private void requireServable(int floor) {
+    private void requireServes(int floor) {
         if (!servesFloor(floor)) {
-            throw new IllegalArgumentException(
-                    "car %d does not serve floor %d".formatted(id, floor));
+            throw new IllegalArgumentException("car " + id + " does not serve floor " + floor);
         }
     }
+```
 
-    // =====================================================================
-    //  THE LOOK ALGORITHM
-    // =====================================================================
+**Part 2 — LOOK.** These are the three rules from §6.2, written as code. Read `nextStopGoingUp()` next to the rules.
 
-    /**
-     * LOOK: continue in the committed direction to the furthest *requested* floor,
-     * then reverse. (SCAN would continue to the physical end of the shaft; C-LOOK
-     * would jump back to the start. Both waste travel for humans.)
-     */
+```java
+// ElevatorCar.java  (part 2 of 5)
+    // =========================================================================
+    //  2. THE LOOK ALGORITHM - "which floor do I head to next?"
+    // =========================================================================
+
     public OptionalInt nextTarget() {
-        switch (committedDirection) {
-            case UP -> {
-                Integer ahead = upStops.ceiling(currentFloor);
-                if (ahead != null) return OptionalInt.of(ahead);
-                // No up-stops ahead. Continue up to the highest DOWN call (we will
-                // reverse there), otherwise reverse now.
-                if (!downStops.isEmpty()) return OptionalInt.of(downStops.last());
-                if (!upStops.isEmpty())   return OptionalInt.of(upStops.first());
-            }
-            case DOWN -> {
-                Integer below = downStops.floor(currentFloor);
-                if (below != null) return OptionalInt.of(below);
-                if (!upStops.isEmpty())   return OptionalInt.of(upStops.first());
-                if (!downStops.isEmpty()) return OptionalInt.of(downStops.last());
-            }
-            case IDLE -> {
-                OptionalInt nearest = nearestPendingStop();
-                if (nearest.isPresent()) return nearest;
+        if (!hasPendingStops()) {
+            return parkingFloor == null ? OptionalInt.empty() : OptionalInt.of(parkingFloor);
+        }
+        int target = switch (direction) {
+            case UP   -> nextStopGoingUp();
+            case DOWN -> nextStopGoingDown();
+            case IDLE -> nearestStop();          // just woke up: go to the closest stop
+        };
+        return OptionalInt.of(target);
+    }
+
+    private int nextStopGoingUp() {
+        // 1. Any UP stop at or above me? Keep going up - this is the normal case.
+        Integer upAhead = upStops.ceiling(currentFloor);
+        if (upAhead != null) return upAhead;
+
+        // 2. No more UP stops above. The next sweep is DOWN, and it must start from
+        //    the HIGHEST down stop (which may be above me - then I keep climbing to it).
+        if (!downStops.isEmpty()) return downStops.last();
+
+        // 3. Only UP stops below me remain: go down to the lowest one and start a new up sweep.
+        return upStops.first();
+    }
+
+    private int nextStopGoingDown() {
+        // Mirror image of nextStopGoingUp().
+        Integer downAhead = downStops.floor(currentFloor);
+        if (downAhead != null) return downAhead;
+
+        if (!upStops.isEmpty()) return upStops.first();
+
+        return downStops.last();
+    }
+
+    private int nearestStop() {
+        int best = Integer.MAX_VALUE;
+        for (int floor : allStops()) {
+            if (best == Integer.MAX_VALUE
+                    || Math.abs(floor - currentFloor) < Math.abs(best - currentFloor)) {
+                best = floor;
             }
         }
-        return parkingTarget != null ? OptionalInt.of(parkingTarget) : OptionalInt.empty();
+        return best;
     }
+```
 
-    private OptionalInt nearestPendingStop() {
-        Integer best = null;
-        for (Integer f : upStops)   best = closer(best, f);
-        for (Integer f : downStops) best = closer(best, f);
-        return best == null ? OptionalInt.empty() : OptionalInt.of(best);
-    }
+**Part 3 — the tick.** The first real check is the safety rule. After that there are only two things the car can do: move one floor, or stop and open the doors. When it stops, it prefers the stop that matches its current direction; if there isn't one, it's at a turnaround point.
 
-    private Integer closer(Integer best, Integer candidate) {
-        if (best == null) return candidate;
-        return Math.abs(candidate - currentFloor) < Math.abs(best - currentFloor)
-                ? candidate : best;
-    }
-
-    // =====================================================================
-    //  THE TICK LOOP
-    // =====================================================================
+```java
+// ElevatorCar.java  (part 3 of 5)
+    // =========================================================================
+    //  3. THE TICK - one step of time
+    // =========================================================================
 
     public void tick() {
-        if (!state.isAvailableForDispatch()) {
-            return;                              // MAINTENANCE / FIRE_SERVICE / E-STOP
+        switch (state) {
+            case MAINTENANCE, EMERGENCY_STOP -> { return; }            // frozen
+            case FIRE_SERVICE -> { runFireRecall(); return; }
+            default -> { }                                             // normal operation
         }
 
-        // ---- SAFETY INVARIANT: never move with the doors not closed. -------
+        // SAFETY RULE: while the door is not closed, the ONLY thing that happens is the door.
         if (!door.isClosed()) {
+            if (isOverloaded()) door.open(DWELL_TICKS);   // buzzer: won't close until someone exits
             door.tick();
-            if (door.isClosed() && !hasPendingStops()) {
-                state = CarState.IDLE;
-            }
+            if (door.isClosed() && !hasPendingStops()) goIdle();
             return;
         }
 
-        OptionalInt target = nextTarget();
-        if (target.isEmpty()) {
-            committedDirection = Direction.IDLE;
-            state = CarState.IDLE;
+        OptionalInt next = nextTarget();
+        if (next.isEmpty()) {
+            goIdle();
             return;
         }
 
-        int t = target.getAsInt();
-        if (t == currentFloor) {
-            arriveAtCurrentFloor();
-            return;
+        int target = next.getAsInt();
+        if (target != currentFloor) {
+            moveOneFloorToward(target);
+            state = CarState.MOVING;
         }
+        if (target == currentFloor) stopHere();
+    }
 
-        int step = Integer.signum(t - currentFloor);
-        committedDirection = Direction.of(step);
+    private void moveOneFloorToward(int target) {
+        if (!door.isClosed()) {                       // defence in depth - should be unreachable
+            throw new IllegalStateException("car " + id + " tried to move with the door open");
+        }
+        int step = Integer.signum(target - currentFloor);
+        direction = Direction.of(step);
         currentFloor += step;
-        state = CarState.MOVING;
-
-        // Arriving exactly on a requested floor is handled on the NEXT tick by the
-        // branch above, which keeps this method single-purpose.
     }
 
-    private void arriveAtCurrentFloor() {
-        // Parking arrival: nothing to serve, no doors.
-        if (parkingTarget != null && parkingTarget == currentFloor && !hasPendingStops()) {
-            parkingTarget = null;
-            committedDirection = Direction.IDLE;
-            state = CarState.IDLE;
+    /** We've reached our target floor: serve whatever is here and open the doors. */
+    private void stopHere() {
+        Direction leavingDirection = serveStopsAtCurrentFloor();
+
+        if (leavingDirection == null) {   // nothing to serve: we just reached our parking spot
+            parkingFloor = null;
+            goIdle();
             return;
         }
-
-        boolean served = false;
-        if (committedDirection == Direction.UP)        served = upStops.remove(currentFloor);
-        else if (committedDirection == Direction.DOWN) served = downStops.remove(currentFloor);
-
-        if (!served) {
-            // We are at a reversal point (or were idle): serve whichever call is here
-            // and adopt that direction for the next sweep.
-            if (upStops.remove(currentFloor)) {
-                committedDirection = Direction.UP;
-                served = true;
-            } else if (downStops.remove(currentFloor)) {
-                committedDirection = Direction.DOWN;
-                served = true;
-            }
-        }
-
-        if (served) {
-            state = CarState.STOPPED;
-            door.openFor(DWELL_HALL_CALL_TICKS);
-        }
+        direction = leavingDirection;     // the hall lantern shows this arrow
+        state = CarState.STOPPED;
+        door.open(DWELL_TICKS);
     }
-
-    // =====================================================================
-    //  ETA ESTIMATION  (used by the cost-based dispatcher)
-    // =====================================================================
 
     /**
-     * Approximate ticks until this car could open its doors at {@code floor} while
-     * committed to {@code callDirection}. Deliberately an approximation: an exact
-     * simulation would have to replay future calls we haven't seen yet.
+     * Removes the stop this visit satisfies and returns the direction we'll leave in.
+     * Prefer the stop that matches the way we're already going; otherwise we're at a
+     * turnaround point, so serve the other direction.
      */
-    public long estimateTicksTo(int floor, Direction callDirection) {
-        if (!servesFloor(floor)) return Long.MAX_VALUE;
+    private Direction serveStopsAtCurrentFloor() {
+        if (direction != Direction.DOWN && upStops.remove(currentFloor))   return servedHere(Direction.UP);
+        if (direction != Direction.UP   && downStops.remove(currentFloor)) return servedHere(Direction.DOWN);
+        if (upStops.remove(currentFloor))   return servedHere(Direction.UP);     // turnaround
+        if (downStops.remove(currentFloor)) return servedHere(Direction.DOWN);   // turnaround
+        return null;
+    }
 
-        // Case A — idle: straight line.
-        if (committedDirection == Direction.IDLE) {
-            return (long) Math.abs(currentFloor - floor) * TRAVEL_TICKS_PER_FLOOR;
+    private Direction servedHere(Direction d) {
+        hallCalls.remove(new HallCall(currentFloor, d));
+        return d;
+    }
+
+    private void goIdle() {
+        state = CarState.IDLE;
+        direction = Direction.IDLE;
+    }
+
+    private void runFireRecall() {
+        if (door.isHeldOpen()) return;                  // parked at the fire floor, waiting
+        if (!door.isClosed()) { door.tick(); return; }  // let the doors finish closing first
+        if (currentFloor != fireRecallFloor) {
+            moveOneFloorToward(fireRecallFloor);        // no stops on the way
+            return;
+        }
+        door.holdOpen();
+    }
+```
+
+**Part 4 — ETA.** These are the four cases from §6.4. The dispatcher calls this for every car.
+
+```java
+// ElevatorCar.java  (part 4 of 5)
+    // =========================================================================
+    //  4. ETA - "how many ticks until I could pick someone up at `floor`?"
+    //     Used by the CostBasedDispatcher. An estimate, not a simulation.
+    // =========================================================================
+
+    public int estimateTicksTo(int floor, Direction callDirection) {
+        int straightLine = Math.abs(currentFloor - floor) * TICKS_PER_FLOOR;
+
+        // Case A - idle: just drive there.
+        if (direction == Direction.IDLE) return straightLine;
+
+        boolean callIsAhead = (direction == Direction.UP) ? floor >= currentFloor
+                                                          : floor <= currentFloor;
+
+        // Case B - "free ride": already heading that way, in the same direction.
+        //          Cost = travel + the stops I'll make on the way.
+        if (direction == callDirection && callIsAhead) {
+            return straightLine + stopsBefore(floor) * STOP_TICKS;
         }
 
-        boolean sameDirection = committedDirection == callDirection;
-        boolean ahead = (committedDirection == Direction.UP   && floor >= currentFloor)
-                     || (committedDirection == Direction.DOWN && floor <= currentFloor);
+        // Cases C & D - I must finish my sweep, turn around, then come back.
+        int turnaround = (direction == Direction.UP) ? highestStop() : lowestStop();
+        int firstLeg  = Math.abs(currentFloor - turnaround) * TICKS_PER_FLOOR
+                      + stopsBefore(turnaround) * STOP_TICKS
+                      + STOP_TICKS;                                     // the stop at the turnaround
+        int secondLeg = Math.abs(turnaround - floor) * TICKS_PER_FLOOR;
+        return firstLeg + secondLeg;
+    }
 
-        // Case B — the "free ride": already sweeping toward the call, same direction.
-        // This is what makes collective control efficient and what nearest-car misses.
-        if (sameDirection && ahead) {
-            return (long) Math.abs(currentFloor - floor) * TRAVEL_TICKS_PER_FLOOR
-                 + (long) stopsBetween(currentFloor, floor) * STOP_PENALTY_TICKS;
+    /** Stops in my current direction strictly between here and `floor`. */
+    private int stopsBefore(int floor) {
+        if (direction == Direction.UP && floor > currentFloor) {
+            return upStops.subSet(currentFloor, false, floor, false).size();
         }
-
-        // Cases C & D — a reversal is required: run to the sweep end, then to the call.
-        int reversalFloor = (committedDirection == Direction.UP) ? highestPendingStop()
-                                                                 : lowestPendingStop();
-        long leg1 = (long) Math.abs(currentFloor - reversalFloor) * TRAVEL_TICKS_PER_FLOOR
-                  + (long) stopsBetween(currentFloor, reversalFloor) * STOP_PENALTY_TICKS;
-        long leg2 = (long) Math.abs(reversalFloor - floor) * TRAVEL_TICKS_PER_FLOOR;
-        return leg1 + leg2 + REVERSAL_PENALTY_TICKS;
+        if (direction == Direction.DOWN && floor < currentFloor) {
+            return downStops.subSet(floor, false, currentFloor, false).size();
+        }
+        return 0;
     }
 
-    private int stopsBetween(int from, int to) {
-        int lo = Math.min(from, to), hi = Math.max(from, to);
-        int count = 0;
-        for (int f : upStops)   if (f > lo && f < hi) count++;
-        for (int f : downStops) if (f > lo && f < hi) count++;
-        return count;
+    private int highestStop() {
+        int highest = currentFloor;
+        for (int f : allStops()) highest = Math.max(highest, f);
+        return highest;
     }
 
-    private int highestPendingStop() {
-        int best = currentFloor;
-        if (!upStops.isEmpty())   best = Math.max(best, upStops.last());
-        if (!downStops.isEmpty()) best = Math.max(best, downStops.last());
-        return best;
+    private int lowestStop() {
+        int lowest = currentFloor;
+        for (int f : allStops()) lowest = Math.min(lowest, f);
+        return lowest;
     }
+```
 
-    private int lowestPendingStop() {
-        int best = currentFloor;
-        if (!upStops.isEmpty())   best = Math.min(best, upStops.first());
-        if (!downStops.isEmpty()) best = Math.min(best, downStops.first());
-        return best;
-    }
+**Part 5 — passengers, parking, special modes.** Notice that `board()` doesn't throw an error when the car is over capacity. A load sensor just *reports* the weight; the car's reaction is to keep its doors open (see `tick()`). `releaseAllStops()` hands back hall calls **with their directions**, so another car can take them correctly.
 
-    // =====================================================================
-    //  BOARDING / SAFETY / MODES
-    // =====================================================================
+```java
+// ElevatorCar.java  (part 5 of 5)
+    // =========================================================================
+    //  5. PASSENGERS, PARKING AND SPECIAL MODES
+    // =========================================================================
 
+    /** Load-sensor reading. Only possible while the doors are open. */
     public void board(int people) {
-        if (load + people > capacity) {
-            throw new IllegalStateException("car %d over capacity".formatted(id));
-        }
-        load += people;
+        if (door.isClosed()) throw new IllegalStateException("doors are closed");
+        load += people;                        // may exceed capacity -> car refuses to close
     }
 
-    public void alight(int people) { load = Math.max(0, load - people); }
-
-    public boolean isFull() { return load >= capacity; }
-
-    public boolean canAcceptHallCall(int floor) {
-        return state.isAvailableForDispatch() && servesFloor(floor) && !isFull();
+    public void alight(int people) {
+        if (door.isClosed()) throw new IllegalStateException("doors are closed");
+        load = Math.max(0, load - people);
     }
+
+    public boolean isFull()       { return load >= capacity; }
+    public boolean isOverloaded() { return load > capacity; }
 
     public boolean servesFloor(int floor) {
-        return floor >= minFloor && floor <= maxFloor && !unservedFloors.contains(floor);
+        return building.hasFloor(floor) && !skippedFloors.contains(floor);
     }
 
-    public void emergencyStop() {
-        state = CarState.EMERGENCY_STOP;
-        committedDirection = Direction.IDLE;
+    /** Can the dispatcher give this car a new hall call? */
+    public boolean canAcceptHallCall(int floor) {
+        return state.isInService() && servesFloor(floor) && !isFull();
     }
 
-    /** Fire recall: drop every pending call, run to the designated floor, park open. */
-    public void enterFireService(int designatedFloor) {
-        upStops.clear();
-        downStops.clear();
-        parkingTarget = null;
+    /** In service and has nothing to do - a candidate for parking. */
+    public boolean isFreeToPark() {
+        return state.isInService() && !hasPendingStops();
+    }
+
+    public void parkAt(int floor) {
+        if (hasPendingStops()) return;                           // real work always wins
+        parkingFloor = (floor == currentFloor) ? null : floor;   // already there: nothing to do
+    }
+
+    public void clearParking() { parkingFloor = null; }
+
+    public void enterMaintenance() { state = CarState.MAINTENANCE; direction = Direction.IDLE; }
+    public void emergencyStop()    { state = CarState.EMERGENCY_STOP; direction = Direction.IDLE; }
+
+    public void enterFireService(int recallFloor) {
+        releaseAllStops();
+        parkingFloor = null;
+        fireRecallFloor = recallFloor;
         state = CarState.FIRE_SERVICE;
-        currentFloor = designatedFloor;   // a real system drives there under fire control
-        door.openFor(Integer.MAX_VALUE);
-    }
-
-    public void enterMaintenance() {
-        state = CarState.MAINTENANCE;
-    }
-
-    /** Returns pending stops so the group controller can REASSIGN them. */
-    public Set<Integer> releaseAllStops() {
-        Set<Integer> released = new HashSet<>();
-        released.addAll(upStops);
-        released.addAll(downStops);
-        upStops.clear();
-        downStops.clear();
-        return released;
     }
 
     public void returnToService() {
-        if (state == CarState.MAINTENANCE || state == CarState.EMERGENCY_STOP
-                || state == CarState.FIRE_SERVICE) {
-            state = CarState.IDLE;
-        }
+        if (!state.isInService()) goIdle();
     }
 
-    // =====================================================================
+    /**
+     * Clears every stop and returns the HALL calls, so the group controller can give them
+     * to another car. Car calls are dropped (the riders are asked to leave / re-press).
+     */
+    public Set<HallCall> releaseAllStops() {
+        Set<HallCall> released = new HashSet<>(hallCalls);
+        upStops.clear();
+        downStops.clear();
+        hallCalls.clear();
+        return released;
+    }
+
+    // =========================================================================
     //  QUERIES
-    // =====================================================================
+    // =========================================================================
 
-    public boolean hasPendingStops()      { return !upStops.isEmpty() || !downStops.isEmpty(); }
-    public int pendingStopCount()         { return upStops.size() + downStops.size(); }
-    public int id()                       { return id; }
-    public int currentFloor()             { return currentFloor; }
-    public Direction committedDirection() { return committedDirection; }
-    public CarState state()               { return state; }
-    public int load()                     { return load; }
-    public int capacity()                 { return capacity; }
-    public Door door()                    { return door; }
-    public Set<Integer> upStops()         { return Set.copyOf(upStops); }
-    public Set<Integer> downStops()       { return Set.copyOf(downStops); }
-
-    @Override public boolean equals(Object o) {
-        return (o instanceof ElevatorCar c) && c.id == this.id;
+    private Set<Integer> allStops() {
+        Set<Integer> all = new HashSet<>(upStops);
+        all.addAll(downStops);
+        return all;
     }
-    @Override public int hashCode() { return Objects.hash(id); }
+
+    public boolean hasPendingStops() { return !upStops.isEmpty() || !downStops.isEmpty(); }
+    public int pendingStopCount()    { return upStops.size() + downStops.size(); }
+    public double loadRatio()        { return load / (double) capacity; }
+
+    public int id()                 { return id; }
+    public int currentFloor()       { return currentFloor; }
+    public Direction direction()    { return direction; }
+    public CarState state()         { return state; }
+    public int load()               { return load; }
+    public Door door()              { return door; }
+    public Set<Integer> upStops()   { return Set.copyOf(upStops); }
+    public Set<Integer> downStops() { return Set.copyOf(downStops); }
+
     @Override public String toString() {
-        return "Car%d[f=%d %s %s load=%d/%d up=%s down=%s]"
-                .formatted(id, currentFloor, committedDirection, state, load, capacity,
-                           upStops, downStops);
+        return "Car%d[floor=%d %s %s door=%s load=%d/%d up=%s down=%s]".formatted(
+                id, currentFloor, direction, state, door.state(), load, capacity, upStops, downStops);
     }
 }
 ```
 
-### 8.3 Traffic detection
-
-```java
-// TrafficMode.java
-package com.building.elevator;
-
-public enum TrafficMode { NORMAL, UP_PEAK, DOWN_PEAK, LUNCH, OFF_PEAK }
-```
-
-```java
-// TrafficMonitor.java
-package com.building.elevator;
-
-import java.time.Clock;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.Deque;
-
-/**
- * Detects the traffic mode from OBSERVED boardings/alightings rather than from the
- * wall clock. Hard-coding "up-peak is 08:00-09:30" breaks in a hospital, a hotel,
- * or any building on a different shift pattern — say this when asked.
- *
- * Hysteresis (requiring N consecutive windows) prevents mode flapping.
- */
-public final class TrafficMonitor {
-
-    private record Event(int floor, boolean boarding, int people, Instant at) {}
-
-    private final int lobbyFloor;
-    private final Duration window;
-    private final Clock clock;
-    private final Deque<Event> events = new ArrayDeque<>();
-
-    private TrafficMode currentMode = TrafficMode.NORMAL;
-    private TrafficMode candidateMode = TrafficMode.NORMAL;
-    private int candidateStreak = 0;
-    private static final int HYSTERESIS_WINDOWS = 2;
-
-    public TrafficMonitor(int lobbyFloor, Duration window, Clock clock) {
-        this.lobbyFloor = lobbyFloor;
-        this.window = window;
-        this.clock = clock;
-    }
-
-    public void recordBoarding(int floor, int people)  { record(floor, true, people); }
-    public void recordAlighting(int floor, int people) { record(floor, false, people); }
-
-    private void record(int floor, boolean boarding, int people) {
-        events.addLast(new Event(floor, boarding, people, clock.instant()));
-        evictOld();
-    }
-
-    private void evictOld() {
-        Instant cutoff = clock.instant().minus(window);
-        while (!events.isEmpty() && events.peekFirst().at().isBefore(cutoff)) {
-            events.removeFirst();
-        }
-    }
-
-    public TrafficMode currentMode() {
-        evictOld();
-        int total = 0, lobbyBoardings = 0, lobbyAlightings = 0;
-        for (Event e : events) {
-            total += e.people();
-            if (e.floor() == lobbyFloor) {
-                if (e.boarding()) lobbyBoardings += e.people();
-                else              lobbyAlightings += e.people();
-            }
-        }
-        if (total < 10) return applyHysteresis(TrafficMode.OFF_PEAK);   // too little data
-
-        double up   = lobbyBoardings  / (double) total;
-        double down = lobbyAlightings / (double) total;
-
-        TrafficMode observed;
-        if (up > 0.30 && down > 0.30)      observed = TrafficMode.LUNCH;
-        else if (up   > 0.60)              observed = TrafficMode.UP_PEAK;
-        else if (down > 0.60)              observed = TrafficMode.DOWN_PEAK;
-        else                               observed = TrafficMode.NORMAL;
-
-        return applyHysteresis(observed);
-    }
-
-    private TrafficMode applyHysteresis(TrafficMode observed) {
-        if (observed == currentMode) { candidateStreak = 0; return currentMode; }
-        if (observed == candidateMode) {
-            if (++candidateStreak >= HYSTERESIS_WINDOWS) {
-                currentMode = observed;
-                candidateStreak = 0;
-            }
-        } else {
-            candidateMode = observed;
-            candidateStreak = 1;
-        }
-        return currentMode;
-    }
-}
-```
-
-### 8.4 Dispatch strategies
+### 8.4 Dispatchers — which car?
 
 ```java
 // Dispatcher.java
-package com.building.elevator;
-
-import java.util.List;
-import java.util.Optional;
-
-@FunctionalInterface
+/** Strategy: decides WHICH car answers a hall call. */
 public interface Dispatcher {
-    /** Empty means "no car can take it right now" — the caller re-queues the call. */
-    Optional<ElevatorCar> assign(Request.HallCall call, List<ElevatorCar> cars, TrafficMode mode);
+    /** Empty = no car can take it right now; the system will retry next tick. */
+    Optional<ElevatorCar> assign(HallCall call, List<ElevatorCar> cars, TrafficMode mode);
 }
 ```
 
+The baseline. Show it first, then explain its flaw.
+
 ```java
 // NearestCarDispatcher.java
-package com.building.elevator;
-
-import java.util.Comparator;
-import java.util.List;
-import java.util.Optional;
-
 /**
- * BASELINE ONLY — present this, then explain why you're replacing it.
- * It ignores direction, load and queue depth, so it happily hands a call to a car
- * one floor away that is travelling the opposite way with eight stops queued.
+ * BASELINE. Show it, then explain why it's not good enough:
+ * it ignores direction and how busy the car already is.
  */
 public final class NearestCarDispatcher implements Dispatcher {
+
     @Override
-    public Optional<ElevatorCar> assign(Request.HallCall call, List<ElevatorCar> cars,
-                                        TrafficMode mode) {
+    public Optional<ElevatorCar> assign(HallCall call, List<ElevatorCar> cars, TrafficMode mode) {
         return cars.stream()
-                .filter(c -> c.canAcceptHallCall(call.floor()))
-                .min(Comparator
-                        .comparingInt((ElevatorCar c) -> Math.abs(c.currentFloor() - call.floor()))
-                        .thenComparingInt(ElevatorCar::id));   // deterministic tie-break
+                .filter(car -> car.canAcceptHallCall(call.floor()))
+                .min(Comparator.comparingInt((ElevatorCar car) -> distance(car, call))
+                               .thenComparingInt(ElevatorCar::id));    // deterministic tie-break
+    }
+
+    private int distance(ElevatorCar car, HallCall call) {
+        return Math.abs(car.currentFloor() - call.floor());
     }
 }
 ```
 
+The one to give as your answer:
+
 ```java
 // CostBasedDispatcher.java
-package com.building.elevator;
-
-import java.time.Clock;
-import java.time.Duration;
-import java.util.List;
-import java.util.Optional;
-
 /**
- * The answer to give. Scores every eligible car and takes the minimum:
+ * THE ANSWER TO GIVE. Score every eligible car, pick the cheapest.
  *
- *   cost = eta
- *        + α × pendingStops        (spread work across the group)
- *        + β × loadRatio           (don't send a nearly-full car)
- *        + γ × directionMismatch   (wrong-way penalty)
- *        + δ × modeBias            (up-peak / down-peak shaping)
- *        − ε × callAgeSeconds      (anti-starvation: old calls outbid new ones)
- *        + ζ × proximityToOtherCar (anti-bunching)
+ *   cost = ETA                               how long until this car can reach the caller
+ *        + BUSY_WEIGHT     x pendingStops    spread work across the fleet
+ *        + CROWDED_WEIGHT  x loadRatio       prefer emptier cars
+ *        + peak-hour rule                    (see modePenalty)
+ *
+ * Wrong-direction cars need no extra penalty - their ETA already includes the detour.
  */
 public final class CostBasedDispatcher implements Dispatcher {
 
-    private final Clock clock;
-    private final double alphaPendingStops   = 2.0;
-    private final double betaLoad            = 8.0;
-    private final double gammaWrongDirection = 5.0;
-    private final double deltaModeBias       = 4.0;
-    private final double epsilonAge          = 3.0;
-    private final double zetaBunching        = 1.5;
+    private static final double BUSY_WEIGHT          = 2.0;
+    private static final double CROWDED_WEIGHT       = 8.0;
+    private static final double LOBBY_RESERVE_WEIGHT = 10.0;
 
-    public CostBasedDispatcher(Clock clock) { this.clock = clock; }
+    private final Building building;
+
+    public CostBasedDispatcher(Building building) {
+        this.building = building;
+    }
 
     @Override
-    public Optional<ElevatorCar> assign(Request.HallCall call, List<ElevatorCar> cars,
-                                        TrafficMode mode) {
+    public Optional<ElevatorCar> assign(HallCall call, List<ElevatorCar> cars, TrafficMode mode) {
         ElevatorCar best = null;
         double bestCost = Double.MAX_VALUE;
 
-        for (ElevatorCar car : cars) {
-            if (!car.canAcceptHallCall(call.floor())) continue;   // eligibility gate
+        for (ElevatorCar car : cars) {                        // cars are in id order
+            if (!car.canAcceptHallCall(call.floor())) continue;
 
-            double cost = cost(car, call, cars, mode);
-            // Strict < gives a deterministic tie-break by iteration (id) order.
-            if (cost < bestCost) {
-                bestCost = cost;
+            double cost = cost(car, call, mode);
+            if (cost < bestCost) {                            // strict "<" = lowest id wins ties
                 best = car;
+                bestCost = cost;
             }
         }
         return Optional.ofNullable(best);
     }
 
-    private double cost(ElevatorCar car, Request.HallCall call,
-                        List<ElevatorCar> allCars, TrafficMode mode) {
-
-        long eta = car.estimateTicksTo(call.floor(), call.direction());
-        if (eta == Long.MAX_VALUE) return Double.MAX_VALUE;
-
-        double cost = eta;
-        cost += alphaPendingStops * car.pendingStopCount();
-        cost += betaLoad * (car.load() / (double) car.capacity());
-
-        boolean wrongWay = car.committedDirection() != Direction.IDLE
-                        && car.committedDirection() != call.direction();
-        if (wrongWay) cost += gammaWrongDirection;
-
-        cost += deltaModeBias * modeBias(car, call, mode);
-        cost += zetaBunching * bunchingPenalty(car, allCars);
-
-        long ageSeconds = Duration.between(call.placedAt(), clock.instant()).toSeconds();
-        cost -= epsilonAge * ageSeconds;        // the older the call, the cheaper it looks
-
-        return cost;
+    double cost(ElevatorCar car, HallCall call, TrafficMode mode) {
+        return car.estimateTicksTo(call.floor(), call.direction())
+             + BUSY_WEIGHT    * car.pendingStopCount()
+             + CROWDED_WEIGHT * car.loadRatio()
+             + modePenalty(car, call, mode);
     }
 
-    /** Shapes the fleet's behaviour for the current traffic pattern. */
-    private double modeBias(ElevatorCar car, Request.HallCall call, TrafficMode mode) {
-        return switch (mode) {
-            // Up-peak: strongly prefer cars that are already low / idle for lobby UP calls.
-            case UP_PEAK   -> call.direction() == Direction.UP
-                              ? car.currentFloor() * 0.1
-                              : 0.0;
-            // Down-peak: prefer cars that are already high for upper-floor DOWN calls.
-            case DOWN_PEAK -> call.direction() == Direction.DOWN
-                              ? -car.currentFloor() * 0.1
-                              : 0.0;
-            case LUNCH, NORMAL, OFF_PEAK -> 0.0;
-        };
-    }
+    /**
+     * Up-peak: an idle car waiting at the lobby is precious (the crowd is there).
+     * Make it expensive to pull that car away for a call somewhere else.
+     * Other modes are handled by the parking policy, not here.
+     */
+    private double modePenalty(ElevatorCar car, HallCall call, TrafficMode mode) {
+        boolean idleAtLobby = car.direction() == Direction.IDLE
+                           && car.currentFloor() == building.lobbyFloor();
+        boolean callIsElsewhere = call.floor() != building.lobbyFloor();
 
-    /** Two cars sitting on top of each other serve the building badly — spread them. */
-    private double bunchingPenalty(ElevatorCar car, List<ElevatorCar> allCars) {
-        int nearest = Integer.MAX_VALUE;
-        for (ElevatorCar other : allCars) {
-            if (other.id() == car.id()) continue;
-            nearest = Math.min(nearest, Math.abs(other.currentFloor() - car.currentFloor()));
+        if (mode == TrafficMode.UP_PEAK && idleAtLobby && callIsElsewhere) {
+            return LOBBY_RESERVE_WEIGHT;
         }
-        return nearest == Integer.MAX_VALUE ? 0.0 : Math.max(0, 3 - nearest);
+        return 0.0;
     }
 }
 ```
+
+For tall buildings. It wraps any other dispatcher:
 
 ```java
 // ZonedDispatcher.java
-package com.building.elevator;
-
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-
 /**
- * For tall buildings: cars own contiguous bands of floors, which slashes round-trip
- * time. Falls back to the delegate when no in-zone car is eligible, so a zone outage
- * degrades service instead of breaking it.
+ * Tall buildings: each group of cars "owns" a band of floors.
+ * Wraps another dispatcher (usually CostBasedDispatcher) and only narrows the car list.
  */
 public final class ZonedDispatcher implements Dispatcher {
 
-    private final Map<Integer, List<Integer>> zoneToCarIds;   // zoneIndex -> car ids
-    private final int floorsPerZone;
-    private final int minFloor;
-    private final Dispatcher withinZone;
+    public record Zone(int lowestFloor, int highestFloor, Set<Integer> carIds) {
+        boolean contains(int floor) { return floor >= lowestFloor && floor <= highestFloor; }
+    }
 
-    public ZonedDispatcher(Map<Integer, List<Integer>> zoneToCarIds, int floorsPerZone,
-                           int minFloor, Dispatcher withinZone) {
-        this.zoneToCarIds = Map.copyOf(zoneToCarIds);
-        this.floorsPerZone = floorsPerZone;
-        this.minFloor = minFloor;
-        this.withinZone = withinZone;
+    private final List<Zone> zones;
+    private final Dispatcher inner;
+
+    public ZonedDispatcher(List<Zone> zones, Dispatcher inner) {
+        this.zones = List.copyOf(zones);
+        this.inner = inner;
     }
 
     @Override
-    public Optional<ElevatorCar> assign(Request.HallCall call, List<ElevatorCar> cars,
-                                        TrafficMode mode) {
-        int zone = (call.floor() - minFloor) / floorsPerZone;
-        List<Integer> ids = zoneToCarIds.getOrDefault(zone, List.of());
+    public Optional<ElevatorCar> assign(HallCall call, List<ElevatorCar> cars, TrafficMode mode) {
+        for (Zone zone : zones) {
+            if (!zone.contains(call.floor())) continue;
 
-        List<ElevatorCar> inZone = cars.stream().filter(c -> ids.contains(c.id())).toList();
-        Optional<ElevatorCar> chosen = withinZone.assign(call, inZone, mode);
-
-        return chosen.isPresent() ? chosen : withinZone.assign(call, cars, mode);
+            List<ElevatorCar> zoneCars = cars.stream()
+                    .filter(car -> zone.carIds().contains(car.id()))
+                    .toList();
+            Optional<ElevatorCar> chosen = inner.assign(call, zoneCars, mode);
+            if (chosen.isPresent()) return chosen;
+        }
+        // No zone car available (all busy / broken): degrade gracefully, use any car.
+        return inner.assign(call, cars, mode);
     }
 }
 ```
 
-### 8.5 Parking policy
+> **A real-world note on zoning:** with up/down buttons, a lobby UP call doesn't tell you which zone the person is going to. That's why zoned buildings have separate lift banks at the lobby ("floors 1–15" / "floors 16–30"), or use destination dispatch.
+
+### 8.5 `TrafficMonitor` — which rush-hour mode?
+
+```java
+// TrafficMonitor.java
+/**
+ * Works out the traffic mode from what passengers actually DO, not from the clock.
+ * (Hard-coding "up-peak = 8 to 9:30" breaks in a hospital, a hotel, or on a holiday.)
+ */
+public final class TrafficMonitor {
+
+    private static final double PEAK_SHARE   = 0.60;  // >60% of trips start (or end) at the lobby
+    private static final double LUNCH_SHARE  = 0.30;  // >30% both ways
+    private static final int MIN_TRIPS       = 10;    // below this, the building is quiet
+    private static final int CONFIRMATIONS   = 2;     // same answer twice in a row before switching
+
+    private record Movement(long tick, int floor, boolean boarding, int people) {}
+
+    private final int lobbyFloor;
+    private final int windowTicks;
+    private final Deque<Movement> recent = new ArrayDeque<>();
+
+    private TrafficMode mode = TrafficMode.OFF_PEAK;
+    private TrafficMode candidate = TrafficMode.OFF_PEAK;
+    private int timesSeen = 0;
+
+    public TrafficMonitor(int lobbyFloor, int windowTicks) {
+        this.lobbyFloor = lobbyFloor;
+        this.windowTicks = windowTicks;
+    }
+
+    public void recordBoarding(long tick, int floor, int people) {
+        recent.addLast(new Movement(tick, floor, true, people));
+    }
+
+    public void recordAlighting(long tick, int floor, int people) {
+        recent.addLast(new Movement(tick, floor, false, people));
+    }
+
+    /** Called by the system ONCE per window - not on every read - so hysteresis means something. */
+    public void evaluate(long now) {
+        while (!recent.isEmpty() && recent.peekFirst().tick() < now - windowTicks) {
+            recent.removeFirst();
+        }
+
+        TrafficMode observed = classify();
+
+        // Hysteresis: only switch after seeing the same new mode CONFIRMATIONS times in a row.
+        if (observed == mode) {
+            timesSeen = 0;
+            return;
+        }
+        if (observed != candidate) {
+            candidate = observed;
+            timesSeen = 0;
+        }
+        timesSeen++;
+        if (timesSeen >= CONFIRMATIONS) {
+            mode = observed;
+            timesSeen = 0;
+        }
+    }
+
+    private TrafficMode classify() {
+        int boardings = 0, alightings = 0, boardedAtLobby = 0, leftAtLobby = 0;
+
+        for (Movement m : recent) {
+            if (m.boarding()) {
+                boardings += m.people();
+                if (m.floor() == lobbyFloor) boardedAtLobby += m.people();
+            } else {
+                alightings += m.people();
+                if (m.floor() == lobbyFloor) leftAtLobby += m.people();
+            }
+        }
+        if (boardings < MIN_TRIPS) return TrafficMode.OFF_PEAK;
+
+        // Compare boardings with boardings and alightings with alightings.
+        // (Mixing them halves both shares - every trip is one boarding AND one alighting.)
+        double startAtLobby = boardedAtLobby / (double) boardings;
+        double endAtLobby   = alightings == 0 ? 0 : leftAtLobby / (double) alightings;
+
+        if (startAtLobby > PEAK_SHARE)                          return TrafficMode.UP_PEAK;
+        if (endAtLobby   > PEAK_SHARE)                          return TrafficMode.DOWN_PEAK;
+        if (startAtLobby > LUNCH_SHARE && endAtLobby > LUNCH_SHARE) return TrafficMode.LUNCH;
+        return TrafficMode.NORMAL;
+    }
+
+    public TrafficMode mode() { return mode; }
+}
+```
+
+### 8.6 Parking — where do idle cars wait?
 
 ```java
 // ParkingPolicy.java
-package com.building.elevator;
-
-import java.util.List;
-import java.util.OptionalInt;
-
-@FunctionalInterface
+/** Strategy: where should a car with nothing to do wait? */
 public interface ParkingPolicy {
     OptionalInt parkingFloorFor(ElevatorCar car, List<ElevatorCar> allCars, TrafficMode mode);
 }
@@ -1257,400 +1386,562 @@ public interface ParkingPolicy {
 
 ```java
 // TrafficAwareParkingPolicy.java
-package com.building.elevator;
-
-import java.util.List;
-import java.util.OptionalInt;
-
 /**
- * Where idle cars wait. Cheap to implement, disproportionately large effect on
- * average waiting time — this is the answer to "how do you handle peak periods"
- * that most candidates never reach.
+ * Put idle cars where the NEXT call is most likely to come from.
+ * Cheap to build, big effect on average waiting time.
  */
 public final class TrafficAwareParkingPolicy implements ParkingPolicy {
 
-    private final int lobbyFloor;
-    private final int minFloor;
-    private final int maxFloor;
+    private final Building building;
 
-    public TrafficAwareParkingPolicy(int lobbyFloor, int minFloor, int maxFloor) {
-        this.lobbyFloor = lobbyFloor;
-        this.minFloor = minFloor;
-        this.maxFloor = maxFloor;
+    public TrafficAwareParkingPolicy(Building building) {
+        this.building = building;
     }
 
     @Override
-    public OptionalInt parkingFloorFor(ElevatorCar car, List<ElevatorCar> allCars,
-                                       TrafficMode mode) {
-        if (car.hasPendingStops() || !car.state().isAvailableForDispatch()) {
-            return OptionalInt.empty();
-        }
-
-        List<ElevatorCar> idle = allCars.stream()
-                .filter(c -> !c.hasPendingStops() && c.state().isAvailableForDispatch())
-                .sorted((a, b) -> Integer.compare(a.id(), b.id()))
+    public OptionalInt parkingFloorFor(ElevatorCar car, List<ElevatorCar> allCars, TrafficMode mode) {
+        List<ElevatorCar> freeCars = allCars.stream()
+                .filter(ElevatorCar::isFreeToPark)
+                .sorted(Comparator.comparingInt(ElevatorCar::id))
                 .toList();
-        int index = idle.indexOf(car);
-        int n = Math.max(1, idle.size());
-        if (index < 0) return OptionalInt.empty();
 
-        return switch (mode) {
-            // Everyone is arriving: keep the fleet at the lobby, but leave one car
-            // upstairs so interfloor traffic isn't stranded.
-            case UP_PEAK -> OptionalInt.of(
-                    index == 0 ? lobbyFloor
-                               : (index == idle.size() - 1 ? midFloor() : lobbyFloor));
+        int i = freeCars.indexOf(car);         // this car's slot among the free cars
+        if (i < 0) return OptionalInt.empty(); // busy or out of service
+        int n = freeCars.size();
 
-            // Everyone is leaving: pre-position HIGH, so a DOWN call is met immediately.
-            case DOWN_PEAK -> OptionalInt.of(spread(index, n, midFloor(), maxFloor));
+        int lobby  = building.lobbyFloor();
+        int bottom = building.minFloor();
+        int middle = building.middleFloor();
+        int top    = building.maxFloor();
 
-            // Two-way lobby traffic: half at the lobby, half spread above.
-            case LUNCH -> OptionalInt.of(
-                    index % 2 == 0 ? lobbyFloor : spread(index, n, lobbyFloor, maxFloor));
+        int floor = switch (mode) {
+            // Morning: everyone arrives at the lobby. Wait there - but keep one car
+            // mid-building so people moving between floors aren't stranded.
+            case UP_PEAK -> (n > 1 && i == n - 1) ? middle : lobby;
 
-            // Random interfloor traffic: minimise expected distance to a uniform call
-            // by spreading cars evenly:  floor_i = min + (2i + 1)(max - min) / 2n
-            case NORMAL, OFF_PEAK -> OptionalInt.of(
-                    minFloor + ((2 * index + 1) * (maxFloor - minFloor)) / (2 * n));
+            // Evening: calls come from upper floors. Spread cars over the upper half.
+            case DOWN_PEAK -> spreadEvenly(i, n, middle, top);
+
+            // Lunch: half the cars at the lobby, the other half spread above it.
+            case LUNCH -> (i % 2 == 0) ? lobby : spreadEvenly(i / 2, n / 2, lobby, top);
+
+            // Random traffic: spread evenly so any floor is close to some car.
+            case NORMAL, OFF_PEAK -> spreadEvenly(i, n, bottom, top);
         };
+        return OptionalInt.of(floor);
     }
 
-    private int midFloor() { return minFloor + (maxFloor - minFloor) / 2; }
-
-    private int spread(int index, int n, int lo, int hi) {
-        return lo + ((2 * index + 1) * (hi - lo)) / (2 * n);
+    /**
+     * Cut [low, high] into n equal bands and return the middle of band i.
+     * Example: 3 cars, floors 0..20 -> 3, 10, 16.
+     */
+    static int spreadEvenly(int i, int n, int low, int high) {
+        return low + (2 * i + 1) * (high - low) / (2 * n);
     }
 }
 ```
 
-### 8.6 `ElevatorSystem` — the group controller
+### 8.7 `ElevatorSystem` — the group controller
+
+This class connects everything. Notice what it does **not** do: it never decides the order of a car's stops. That's the car's job.
 
 ```java
 // ElevatorSystem.java
-package com.building.elevator;
-
-import java.time.Clock;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Optional;
-import java.util.OptionalInt;
-import java.util.Set;
-
 /**
- * The "group controller". Owns dispatch (which car), traffic mode, and parking.
- * It deliberately does NOT know about LOOK — stop ordering belongs to ElevatorCar.
- * That single boundary is what stops this class from becoming a god object.
+ * The GROUP CONTROLLER. Decides which car gets each hall call, tracks traffic,
+ * parks idle cars. It knows nothing about LOOK - stop ordering is the car's job.
  */
 public final class ElevatorSystem {
 
+    private static final int MODE_CHECK_EVERY_TICKS = 300;   // re-evaluate traffic mode (~5 min)
+
+    private final Building building;
     private final List<ElevatorCar> cars;
     private final Dispatcher dispatcher;
     private final TrafficMonitor trafficMonitor;
     private final ParkingPolicy parkingPolicy;
-    private final Clock clock;
 
-    /** De-duplication: two people pressing UP on floor 7 is ONE call. */
-    private final Set<String> activeHallCalls = new HashSet<>();
+    private long now = 0;   // current tick
 
-    /** Calls no car could take yet (all full / out of service). Retried every tick. */
-    private final Deque<Request.HallCall> unassigned = new ArrayDeque<>();
+    /** Lit hall buttons -> tick when first pressed. Also our de-duplication set. */
+    private final Map<HallCall, Long> waitingSince = new LinkedHashMap<>();
 
-    public ElevatorSystem(List<ElevatorCar> cars, Dispatcher dispatcher,
-                          TrafficMonitor trafficMonitor, ParkingPolicy parkingPolicy,
-                          Clock clock) {
+    /** Hall calls no car could take yet (all full / out of service). Oldest first. */
+    private final Deque<HallCall> unassigned = new ArrayDeque<>();
+
+    // Stats for the simulation harness.
+    private long totalWaitTicks = 0;
+    private int answeredCalls = 0;
+
+    public ElevatorSystem(Building building, List<ElevatorCar> cars, Dispatcher dispatcher,
+                          TrafficMonitor trafficMonitor, ParkingPolicy parkingPolicy) {
+        this.building = building;
         this.cars = List.copyOf(cars);
         this.dispatcher = dispatcher;
         this.trafficMonitor = trafficMonitor;
         this.parkingPolicy = parkingPolicy;
-        this.clock = clock;
     }
 
-    // =====================================================================
-    //  REQUEST INTAKE
-    // =====================================================================
+    /** Sensible defaults: cost-based dispatch + traffic-aware parking. */
+    public static ElevatorSystem create(Building building, int numberOfCars, int capacity) {
+        List<ElevatorCar> cars = new ArrayList<>();
+        for (int id = 0; id < numberOfCars; id++) {
+            cars.add(new ElevatorCar(id, building, capacity));
+        }
+        return new ElevatorSystem(
+                building,
+                cars,
+                new CostBasedDispatcher(building),
+                new TrafficMonitor(building.lobbyFloor(), MODE_CHECK_EVERY_TICKS),
+                new TrafficAwareParkingPolicy(building));
+    }
+
+    // =========================================================================
+    //  BUTTON PRESSES
+    // =========================================================================
 
     /** Someone pressed UP or DOWN in a lift lobby. */
     public void requestHallCall(int floor, Direction direction) {
-        Request.HallCall call = new Request.HallCall(floor, direction, clock.instant());
+        validateHallButton(floor, direction);
+        HallCall call = new HallCall(floor, direction);
 
-        if (!activeHallCalls.add(call.key())) {
-            return;                       // already lit and assigned — ignore
-        }
-        if (!tryAssign(call)) {
-            unassigned.addLast(call);     // retried on every tick
-        }
+        if (waitingSince.containsKey(call)) return;   // already lit: 2 presses = 1 call
+        waitingSince.put(call, now);
+        assignOrQueue(call);
     }
 
-    /** Someone pressed a destination button inside car {@code carId}. */
+    /** Someone pressed a floor button inside a car. */
     public void requestCarCall(int carId, int floor) {
-        ElevatorCar car = carById(carId);
-        if (!car.servesFloor(floor)) {
-            return;                       // invalid button — beep, don't register
+        ElevatorCar car = car(carId);
+        if (!car.state().isInService() || !car.servesFloor(floor)) return;  // beep, ignore
+        car.addCarCall(floor);                        // no dispatch: the rider is already inside
+    }
+
+    private void validateHallButton(int floor, Direction direction) {
+        if (!building.hasFloor(floor)) {
+            throw new IllegalArgumentException("no floor " + floor);
         }
-        car.addCarCall(floor);            // NO dispatch decision: the rider is inside
+        if (floor == building.maxFloor() && direction == Direction.UP
+                || floor == building.minFloor() && direction == Direction.DOWN) {
+            throw new IllegalArgumentException("no " + direction + " button on floor " + floor);
+        }
     }
 
-    private boolean tryAssign(Request.HallCall call) {
-        TrafficMode mode = trafficMonitor.currentMode();
-        Optional<ElevatorCar> chosen = dispatcher.assign(call, cars, mode);
-        chosen.ifPresent(car -> car.addHallCall(call));
-        return chosen.isPresent();
+    private void assignOrQueue(HallCall call) {
+        Optional<ElevatorCar> chosen = dispatcher.assign(call, cars, trafficMonitor.mode());
+        if (chosen.isPresent()) chosen.get().addHallCall(call);
+        else                    unassigned.addLast(call);
     }
 
-    // =====================================================================
-    //  THE MAIN LOOP
-    // =====================================================================
+    // =========================================================================
+    //  THE MAIN LOOP - one call = one tick of time
+    // =========================================================================
 
     public void tick() {
+        now++;
         retryUnassignedCalls();
         cars.forEach(ElevatorCar::tick);
-        clearServedHallCalls();
-        applyParking();
+        turnOffAnsweredHallLamps();
+        if (now % MODE_CHECK_EVERY_TICKS == 0) trafficMonitor.evaluate(now);
+        updateParking();
     }
 
     private void retryUnassignedCalls() {
-        int pending = unassigned.size();
-        for (int i = 0; i < pending; i++) {
-            Request.HallCall call = unassigned.removeFirst();
-            if (!tryAssign(call)) unassigned.addLast(call);
+        int count = unassigned.size();
+        for (int i = 0; i < count; i++) {
+            assignOrQueue(unassigned.removeFirst());   // goes back to the end if it fails again
         }
     }
 
     /**
-     * A hall lamp goes out when a car is stopped with its doors open at that floor
-     * AND is committed to that call's direction. The direction check is what stops
-     * an upward car from "clearing" a DOWN lamp it isn't actually serving.
+     * A hall lamp goes out when a car has its doors open at that floor AND is going in
+     * that call's direction. The direction check stops a car going UP from switching off
+     * the DOWN lamp for people it isn't taking.
      */
-    private void clearServedHallCalls() {
+    private void turnOffAnsweredHallLamps() {
         for (ElevatorCar car : cars) {
             if (car.state() != CarState.STOPPED || car.door().isClosed()) continue;
-            activeHallCalls.remove(car.currentFloor() + ":" + car.committedDirection());
+
+            HallCall answered = new HallCall(car.currentFloor(), car.direction());
+            Long pressedAt = waitingSince.remove(answered);
+            if (pressedAt != null) {
+                totalWaitTicks += now - pressedAt;
+                answeredCalls++;
+            }
         }
     }
 
-    private void applyParking() {
-        TrafficMode mode = trafficMonitor.currentMode();
+    private void updateParking() {
+        TrafficMode mode = trafficMonitor.mode();
         for (ElevatorCar car : cars) {
-            OptionalInt target = parkingPolicy.parkingFloorFor(car, cars, mode);
-            // Avoid the `cond ? intValue : null` ternary — it silently boxes and is a
-            // classic NPE footgun. Be explicit instead.
-            if (target.isPresent()) car.setParkingTarget(target.getAsInt());
-            else                    car.setParkingTarget(null);
+            OptionalInt floor = parkingPolicy.parkingFloorFor(car, cars, mode);
+            if (floor.isPresent()) car.parkAt(floor.getAsInt());
+            else                   car.clearParking();
         }
     }
 
-    // =====================================================================
-    //  BOARDING (feeds the traffic monitor)
-    // =====================================================================
+    // =========================================================================
+    //  PASSENGERS (the load sensor also feeds the traffic monitor)
+    // =========================================================================
 
     public void board(int carId, int people) {
-        ElevatorCar car = carById(carId);
+        ElevatorCar car = car(carId);
         car.board(people);
-        trafficMonitor.recordBoarding(car.currentFloor(), people);
+        trafficMonitor.recordBoarding(now, car.currentFloor(), people);
     }
 
     public void alight(int carId, int people) {
-        ElevatorCar car = carById(carId);
+        ElevatorCar car = car(carId);
         car.alight(people);
-        trafficMonitor.recordAlighting(car.currentFloor(), people);
+        trafficMonitor.recordAlighting(now, car.currentFloor(), people);
     }
 
-    // =====================================================================
-    //  SERVICE MODES
-    // =====================================================================
+    // =========================================================================
+    //  FAILURES AND SPECIAL MODES
+    // =========================================================================
 
-    /** Taking a car out of the group must NOT lose its hall calls — reassign them. */
+    /** Technician takes a car out. Its hall calls must go to other cars, not vanish. */
     public void takeOutOfService(int carId) {
-        ElevatorCar car = carById(carId);
-        Set<Integer> orphaned = car.releaseAllStops();
+        ElevatorCar car = car(carId);
         car.enterMaintenance();
-        for (int floor : orphaned) {
-            // Direction is unknown for orphaned stops, so re-raise both and let
-            // de-duplication + the dispatcher sort it out.
-            requestHallCall(floor, Direction.UP);
-            requestHallCall(floor, Direction.DOWN);
-        }
+        car.releaseAllStops().forEach(this::assignOrQueue);   // lamps stay lit, wait time keeps counting
     }
 
-    /** Fire alarm: every car abandons its calls and recalls to the designated floor. */
-    public void fireAlarm(int designatedFloor) {
-        activeHallCalls.clear();
+    /** E-stop / fault: same idea - the stuck car's hall calls are re-dispatched. */
+    public void emergencyStop(int carId) {
+        ElevatorCar car = car(carId);
+        car.emergencyStop();
+        car.releaseAllStops().forEach(this::assignOrQueue);
+    }
+
+    public void returnToService(int carId) {
+        car(carId).returnToService();
+    }
+
+    /** Fire alarm: all hall calls cancelled, every car recalled to the fire floor. */
+    public void fireAlarm(int recallFloor) {
+        waitingSince.clear();
         unassigned.clear();
-        cars.forEach(c -> c.enterFireService(designatedFloor));
+        cars.forEach(car -> car.enterFireService(recallFloor));
     }
 
-    public List<ElevatorCar> cars() { return cars; }
+    // =========================================================================
+    //  QUERIES
+    // =========================================================================
 
-    public TrafficMode trafficMode() { return trafficMonitor.currentMode(); }
-
-    private ElevatorCar carById(int id) {
-        for (ElevatorCar c : cars) if (c.id() == id) return c;
-        throw new IllegalArgumentException("no such car: " + id);
-    }
-
-    // =====================================================================
-    //  BOOTSTRAP
-    // =====================================================================
-
-    public static ElevatorSystem defaultBuilding(int cars, int minFloor, int maxFloor,
-                                                 int capacity, Clock clock) {
-        List<ElevatorCar> fleet = new ArrayList<>();
-        for (int i = 0; i < cars; i++) {
-            fleet.add(new ElevatorCar(i, minFloor, maxFloor, capacity));
+    public ElevatorCar car(int id) {
+        for (ElevatorCar car : cars) {
+            if (car.id() == id) return car;
         }
-        return new ElevatorSystem(
-                fleet,
-                new CostBasedDispatcher(clock),
-                new TrafficMonitor(0, java.time.Duration.ofMinutes(5), clock),
-                new TrafficAwareParkingPolicy(0, minFloor, maxFloor),
-                clock);
+        throw new IllegalArgumentException("no car " + id);
+    }
+
+    public List<ElevatorCar> cars()               { return cars; }
+    public long now()                             { return now; }
+    public TrafficMode trafficMode()              { return trafficMonitor.mode(); }
+    public boolean isLit(int floor, Direction d)  { return waitingSince.containsKey(new HallCall(floor, d)); }
+    public int unassignedCount()                  { return unassigned.size(); }
+
+    public double averageWaitTicks() {
+        return answeredCalls == 0 ? 0 : totalWaitTicks / (double) answeredCalls;
     }
 }
 ```
 
+### 8.8 `ElevatorController` — thread safety
+
+Buttons are pressed from many threads at once, but `ElevatorSystem` is deliberately **not** thread-safe. Instead of adding locks everywhere, we send every button press and every tick to **one** thread. It's the same idea as an actor or an event loop. The domain code stays simple, and races are impossible.
+
+```java
+// ElevatorController.java
+/**
+ * The thread-safety layer. Buttons are pressed from many threads (one per panel / API call),
+ * but ElevatorSystem is NOT thread-safe - on purpose.
+ *
+ * Every button press and every tick is pushed onto ONE thread, so the domain code never
+ * needs a lock. This is also where real time enters: one tick every 500 ms.
+ */
+public final class ElevatorController {
+
+    private final ElevatorSystem system;
+    private final ScheduledExecutorService controlThread = Executors.newSingleThreadScheduledExecutor();
+
+    public ElevatorController(ElevatorSystem system) {
+        this.system = system;
+    }
+
+    public void start() {
+        controlThread.scheduleAtFixedRate(this::safeTick, 0, 500, TimeUnit.MILLISECONDS);
+    }
+
+    public void pressHallButton(int floor, Direction direction) {
+        controlThread.execute(() -> system.requestHallCall(floor, direction));
+    }
+
+    public void pressCarButton(int carId, int floor) {
+        controlThread.execute(() -> system.requestCarCall(carId, floor));
+    }
+
+    public void stop() {
+        controlThread.shutdown();
+    }
+
+    private void safeTick() {
+        try {
+            system.tick();
+        } catch (RuntimeException e) {
+            // An uncaught exception would silently cancel the schedule and freeze every car.
+            System.err.println("tick failed: " + e);
+        }
+    }
+}
+```
+
+Why a single thread and not `synchronized` methods? Because every button press can touch several cars (the dispatcher reads all of them), so you'd end up locking the whole system anyway. A single thread gives the same safety with less code, and events are handled in a clear order.
+
 ---
 
-## 9. End-to-End Walkthroughs
+## 9. Walkthroughs (real output)
 
-### 9.1 LOOK on a single car
+All numbers below come from running the code in §8, not from hand calculation. Building: floors 0–20, lobby 0.
 
-Car 0 at floor **3**, committed **UP**. Pending: `upStops = {5, 9}`, `downStops = {7, 2}`.
+### 9.1 LOOK on one car
 
-| Tick | Floor | Direction | `nextTarget()` reasoning | Action |
+The car is at floor **3**, going **UP**. `upStops = {5, 9}` (car calls), `downStops = {2, 7}` (DOWN hall calls).
+
+| Tick | Floor | Dir | What happens | Why |
 |---|---|---|---|---|
-| 1 | 3→4 | UP | `upStops.ceiling(3) = 5` | move |
-| 2 | 4→5 | UP | target 5 | move |
-| 3 | 5 | UP | target == current | **serve 5**, remove from `upStops`, doors open |
-| 4–6 | 5 | UP | doors cycling | — |
-| 7–10 | 5→9 | UP | `upStops.ceiling(5) = 9` | move ×4 |
-| 11 | 9 | UP | target == current | **serve 9**, `upStops` now empty |
-| 12 | 9 | UP→**DOWN** | `upStops.ceiling` = null → `downStops.last() = 7` < 9 → reverse | direction flips |
-| 13–14 | 9→7 | DOWN | target 7 | move ×2 |
-| 15 | 7 | DOWN | `downStops.floor(7) = 7` | **serve 7** |
-| 16–20 | 7→2 | DOWN | `downStops.floor(...) = 2` | move ×5 |
-| 21 | 2 | DOWN | target == current | **serve 2**, all sets empty |
-| 22 | 2 | IDLE | `nextTarget()` empty → parking target | park per traffic mode |
+| 1 | 4 | UP | move | `upStops.ceiling(3) = 5` |
+| 2 | 5 | UP | **stop**, doors start opening | reached 5, removed from `upStops` |
+| 3–7 | 5 | UP | doors open → dwell → close | 5 ticks per stop |
+| 8–10 | 6 → 8 | UP | move, **passes 7 without stopping** | 7 is a DOWN call and we're going UP |
+| 11 | 9 | UP | **stop** | `upStops` is now empty |
+| 12–16 | 9 | UP | doors | |
+| 17 | 8 | **DOWN** | turned around, moving | rule 2: `downStops.last() = 7` |
+| 18 | 7 | DOWN | **stop** | `downStops.floor(8) = 7` |
+| 19–23 | 7 | DOWN | doors | |
+| 24–27 | 6 → 3 | DOWN | move | `downStops.floor(...) = 2` |
+| 28 | 2 | DOWN | **stop** | last stop |
+| 29–32 | 2 | DOWN | doors | |
+| 33 | 2 | IDLE | nothing left → idle (then parking kicks in) | |
 
-Compare: **SCAN** would have run 9 → 20 (top of shaft) before reversing — 22 wasted floors. **SSTF** from floor 3 would go 3→2→5→7→9, and if new low calls kept arriving, floor 9 would starve.
+Stop order: **5 ↑, 9 ↑, 7 ↓, 2 ↓**.
 
-### 9.2 Dispatch — why cost beats nearest
+Compare: **SCAN** would have gone on to floor 20 before turning around (22 extra floors of travel). **SSTF** from floor 3 would go 2 → 5 → 7 → 9, taking the person at 7 *up* first, the wrong way. And if new low calls kept coming, floor 9 might never be served.
 
-Hall call: **floor 8, DOWN**.
+### 9.2 Dispatch: why cost beats nearest
 
-| Car | Floor | Direction | Pending | Load | Nearest-car distance | ETA reasoning | Cost |
-|---|---|---|---|---|---|---|---|
-| A | 7 | UP | {12, 15} | 8/10 | **1** ✅ nearest | must run 7→15, reverse, 15→8 = 8 + 7 + 2 ≈ **17** | 17 + 2·2 + 8·0.8 + 5 = **32.4** |
-| B | 12 | DOWN | {10} | 2/10 | 4 | already sweeping down past 8: 4 travel + 1 stop ≈ **7** | 7 + 2·1 + 8·0.2 + 0 = **10.6** ✅ |
-| C | 2 | IDLE | {} | 0/10 | 6 | idle straight-line = **6** | 6 + 0 + 0 + 0 = **6.0** ✅✅ |
+Hall call: **floor 8, DOWN**. Capacity 10.
 
-- **Nearest-car picks A** — the worst possible choice. A is one floor away but heading the wrong way with a nearly-full car; the passenger waits ~17 ticks and A's existing riders get a detour.
-- **Cost-based picks C**, and would pick B if C didn't exist. Both are far better.
+| Car | Where | Stops | Load | Distance | ETA (from code) | Cost = ETA + 2×stops + 8×load |
+|---|---|---|---|---|---|---|
+| 0 | floor 7, going UP | ↑{12, 15} | 8/10 | **1** ← nearest | must go 7→12→15, turn, 15→8: 8 + 5 + 5 + 7 = **25** | 25 + 4 + 6.4 = **35.4** |
+| 1 | floor 12, going DOWN | ↓{10} | 2/10 | 4 | free ride: 4 floors + 1 stop = **9** | 9 + 2 + 1.6 = **12.6** |
+| 2 | floor 2, IDLE | — | 0/10 | 6 | straight line = **6** | 6 + 0 + 0 = **6.0** ✅ |
 
-This table is the single most persuasive thing you can put on a whiteboard for this question.
+- **Nearest-car picks car 0**, the worst choice: it's heading the wrong way, it's nearly full, and the passenger waits ~25 ticks.
+- **Cost-based picks car 2.** Without car 2 it would pick car 1 (the free ride).
 
-### 9.3 Up-peak morning
+This table is the most convincing thing you can draw on the whiteboard for this question.
 
-```
-08:15 — TrafficMonitor sees 82% of boardings at the lobby → UP_PEAK (after hysteresis)
-
-Effects:
-  • ParkingPolicy sends idle cars to floor 0 (one held at mid-building for interfloor).
-  • modeBias makes low/idle cars cheap for lobby UP calls.
-  • A car that empties out at floor 14 has no stops → parks → returns to the lobby
-    WITHOUT waiting for a call. This is the big win: an empty car sitting at 14
-    during up-peak is a wasted asset.
-  • Cars at capacity are filtered out by canAcceptHallCall(), so a full car doesn't
-    stop at floor 3 for people who cannot board.
-```
-
-### 9.4 Down-peak evening
+### 9.3 A car breaks down
 
 ```
-17:40 — 71% of alightings at the lobby → DOWN_PEAK
-
-Effects:
-  • Parking spreads idle cars across the UPPER half (floors 10, 14, 18 for 3 cars),
-    so an upper-floor DOWN press is answered in 1–2 ticks instead of 15.
-  • modeBias subtracts currentFloor × 0.1 for DOWN calls → high cars win.
-  • A car arriving at the lobby unloads and immediately gets a parking target upstairs.
+2 cars. Someone presses (15, DOWN) → assigned to car X.
+Technician takes car X out of service.
+  → car X hands back {(15, DOWN)}, direction included
+  → the system dispatches it to car Y. The lamp stays lit, the wait time keeps counting.
+Car Y reaches 15 going down → lamp off. Measured wait: 15 ticks.
 ```
 
-### 9.5 Anti-starvation in action
+In the previous version this call was **lost**: the system tried to re-raise it through `requestHallCall`, which saw the lamp was still lit and ignored it as a duplicate.
+
+### 9.4 Simulation: nearest vs cost
+
+4 cars, floors 0–20, random hall calls and car calls, 50,000 ticks, same random seed for both:
+
+| Dispatcher | Average wait (AWT) |
+|---|---|
+| Nearest car | 35.4 ticks |
+| **Cost-based** | **26.8 ticks** (≈ 24% less) |
+
+This is how you should justify a dispatcher: **measure average wait in a simulation**, don't just argue.
+
+### 9.5 Rush hours: where 3 idle cars park (floors 0–20)
+
+| Mode | Parking floors | Reasoning |
+|---|---|---|
+| UP_PEAK | **0, 0, 10** | Crowd is at the lobby; keep one car mid-building for floor-to-floor trips |
+| DOWN_PEAK | **11, 15, 18** | Calls come from upstairs; spread over the upper half |
+| LUNCH | **0, 10, 0** | Every other car at the lobby, the rest above |
+| NORMAL / OFF_PEAK | **3, 10, 16** | Evenly spread, so every floor is close to some car |
+
+**Morning, step by step:** the monitor sees more than 60% of boardings at the lobby in two checks in a row → UP_PEAK. A car that drops its last passenger at floor 14 now has no stops, gets parking floor 0, and **comes back to the lobby without waiting for a call**. An empty car sitting at floor 14 in the morning is wasted. Meanwhile, full cars are skipped by the dispatcher, so they don't stop at floors where nobody can get in.
+
+**Evening:** more than 60% of drop-offs are at the lobby → DOWN_PEAK. A car that empties at the lobby immediately gets a parking floor upstairs.
+
+### 9.6 Fire alarm
 
 ```
-t=0    Call (18, DOWN) placed. All cars busy low in the building → cost is high, C wins
-       other calls repeatedly.
-t=30s  ageSeconds = 30 → cost -= 3 × 30 = 90.
-       The call now outbids every fresh call and is assigned on the next evaluation.
+Car 0 on its way to 12, car 1 on its way to 18. fireAlarm(0):
+  → all hall lamps off, all stops cleared
+  → each car finishes closing its doors (if open), drives to floor 0 without stopping,
+    opens its doors and holds them open
+Result: both cars at floor 0, state FIRE_SERVICE, doors held open.
 ```
-
-Without the age term, a busy lobby can indefinitely outbid a lone passenger on floor 18. **LOOK guarantees no starvation *within* a car; the age term guarantees no starvation *across* cars.** Say both halves — they're different guarantees.
 
 ---
 
 ## 10. Extensibility
 
-| Want | How | Files touched |
+| Want | How | Change |
 |---|---|---|
-| **Destination dispatch** | New `DestinationDispatcher implements Dispatcher` that bins passengers by destination; hall panel sends `(floor, destination)` | +1 class |
-| **Express / sky-lobby cars** | Construct with `unservedFloors` — `servesFloor()` already gates it | 0 |
-| **Zoning for a 60-storey tower** | `ZonedDispatcher` wrapping `CostBasedDispatcher` | 0 |
-| **VIP / priority calls** | Add a `PriorityCall` case to the sealed `Request` — the compiler lists every place to handle it | compiler-guided |
-| **Different jitter of parking** | Swap `ParkingPolicy` implementation | 0 |
-| **Real kinematics** | Replace `TRAVEL_TICKS_PER_FLOOR` with a `TravelTimeModel` interface (accel/decel curves) | +1 interface |
-| **ML-based dispatch** | `CostBasedDispatcher` already returns a score — replace the linear cost with a learned model behind the same `Dispatcher` interface | +1 class |
-| **Multiple buildings / remote monitoring** | `ElevatorSystem` publishes state events; add an adapter | +1 class |
-| **Badge-restricted floors** | Extend `servesFloor(floor)` into `servesFloor(floor, credential)` | 1 method |
+| **Destination dispatch** | New `DestinationDispatcher`; the hall panel sends `(floor, destination)`; group people by destination | +1 class, +1 request type |
+| **Express / sky-lobby cars** | Create the car with `skippedFloors`; `servesFloor()` already handles it | none |
+| **Zoning for a 60-floor tower** | `new ZonedDispatcher(zones, new CostBasedDispatcher(building))` | none |
+| **Re-dispatch slow calls** | Every N ticks, re-score calls waiting longer than a threshold; move them if another car is much better | +1 method in `ElevatorSystem` |
+| **VIP / priority calls** | Add a priority field or a new request type; give it a big negative cost | small |
+| **Different parking rules** | New `ParkingPolicy` | +1 class |
+| **Real motion physics** | Replace `TICKS_PER_FLOOR` with a `TravelTimeModel` interface (acceleration, top speed) | +1 interface |
+| **ML-based dispatch** | Same `Dispatcher` interface, learned cost instead of the formula | +1 class |
+| **Badge-restricted floors** | `servesFloor(floor)` → `servesFloor(floor, badge)` | 1 method |
+| **Monitoring dashboard** | `ElevatorSystem` publishes events (car moved, call answered); add a listener | +1 interface |
 
-> **The point to make out loud:** *"Every one of these is a new class implementing an existing interface. The `ElevatorCar` tick loop and the LOOK algorithm never change, because 'which car' and 'what order' are genuinely separate concerns."*
+> **The point to say out loud:** *"Almost every extension is a new class behind an existing interface. The LOOK code in `ElevatorCar` never changes, because 'which car' and 'what order' are separate concerns."*
 
 ---
 
 ## 11. Failure & Safety Scenarios
 
-Safety questions separate a good answer from a great one here. Elevators are life-safety equipment.
+Elevators are life-safety equipment. Safety questions separate a good answer from a great one.
 
 | # | Scenario | Handling |
 |---|---|---|
-| 1 | **Doors obstructed** | Photo-eye calls `door.reopen()`, dwell restarts. After N reopens, sound a buzzer and close on reduced force (nudging). |
-| 2 | **Car ordered to move with doors open** | Impossible by construction: `tick()` returns early unless `door.isClosed()`. The invariant is enforced in one place. |
-| 3 | **Car goes out of service mid-run** | `releaseAllStops()` returns orphaned floors; the group **re-raises them as hall calls** so waiting passengers are not stranded. Car calls from riders inside are lost — which is why a real car finishes its current run before going out of service. |
-| 4 | **Overload sensor trips** | `isFull()` → excluded from dispatch by `canAcceptHallCall()`; doors stay open, buzzer sounds, last passenger exits. |
-| 5 | **Fire alarm** | `fireAlarm(floor)` — every car drops all calls, recalls to the designated floor, doors open, group control suspended. Phase II (firefighter in-car key) bypasses the group entirely. |
-| 6 | **Power failure** | Emergency power runs cars *one at a time* to the nearest floor and opens doors. Model as a `PowerMode` that shrinks the eligible-car set to one. |
-| 7 | **Passenger trapped between floors** | E-stop state; alarm/intercom; the car is removed from dispatch. `EMERGENCY_STOP` is deliberately not `isAvailableForDispatch()`. |
-| 8 | **Position sensor drift** | Real systems re-sync at terminal limit switches each sweep. In the model: a `resyncAtTerminal()` hook on reaching min/max floor. |
-| 9 | **All cars busy / full** | Hall call goes to the `unassigned` deque and is retried every tick — never dropped silently. |
-| 10 | **Nuisance car calls** (all buttons pressed) | Detect load ≈ 0 with many car calls → cancel all car calls. Real feature, real product name ("anti-nuisance"). |
-| 11 | **Car bunching** | Dispersion term in the cost function + parking spread. |
-| 12 | **Starvation of a far floor** | LOOK within a car + call-age term across cars. |
-| 13 | **Controller crash** | Hall calls are latched in hardware (the lamp is lit); on restart the controller re-reads latched buttons. State is derivable, not lost. |
-| 14 | **Concurrent button presses** | All requests funnel through a single-threaded command queue; car state is only mutated on the control thread. No locks needed in the domain. |
-| 15 | **Floor requested that the car can't serve** | `requireServable()` throws for car calls (programming error) and `servesFloor()` filters hall calls at dispatch (normal). |
+| 1 | **Something blocks the door** | Photo-eye calls `door.open()` again, which restarts the dwell. After many re-opens, a real system sounds a buzzer and closes slowly ("nudging"). |
+| 2 | **Car told to move with the door open** | Can't happen: `tick()` returns early unless the door is closed, and `moveOneFloorToward()` throws as a second line of defence. A random 20,000-tick test confirms it. |
+| 3 | **Car taken out of service** | `releaseAllStops()` returns its hall calls **with directions**; the system gives them to other cars. Car calls are dropped, which is why a real car finishes its current trip first. |
+| 4 | **Emergency stop / car stuck** | Same as #3: the stuck car's hall calls go to other cars. The car is out of dispatch until reset. |
+| 5 | **Overloaded** | The load sensor reads more than capacity → doors stay open (buzzer) until someone steps out. |
+| 6 | **Full (but not over)** | `canAcceptHallCall()` is false, so it takes no new pickups. Its existing stops still stand. |
+| 7 | **Fire alarm** | All lamps off, all stops cleared, every car drives to the fire floor and holds its doors open. "Phase II" (a firefighter with a key inside the car) takes over manually. |
+| 8 | **Power failure** | Emergency power moves cars **one at a time** to the nearest floor and opens the doors. You could model it as a mode that allows only one car to move. |
+| 9 | **All cars busy or broken** | The call goes into the `unassigned` queue and is retried every tick, oldest first. Never dropped. |
+| 10 | **Someone pressed every button** | Anti-nuisance: load ≈ 0 with many car calls → cancel the car calls. |
+| 11 | **Controller crashes** | Hall buttons are latched in hardware (the lamp stays lit). On restart, the controller re-reads them. |
+| 12 | **Buttons pressed at the same time** | Everything goes through the single control thread (§8.8). No locks in the domain. |
+| 13 | **Invalid button** (floor 25 in a 20-floor building, UP on the top floor) | Hall: rejected with an exception (real panels don't have that button). Car: ignored with a beep. |
+| 14 | **Car drifts from its real position** | Real systems re-sync at the top and bottom limit switches on every sweep. |
+| 15 | **A different car answers a hall call** | E.g. car 1 stops at 8 going DOWN for its own reasons, but the call (8, DOWN) belonged to car 2. The lamp goes off correctly (people get into car 1), but car 2 still goes to 8. **Known simplification.** Fix: when a lamp goes off, also remove that call from its owner car. |
 
 ---
 
 ## 12. Testing Strategy
 
-Everything is deterministic because time is discrete and the clock is injected.
+Every test is deterministic, because time is a tick counter.
 
-| Layer | Test | How |
+| What | Test | How |
 |---|---|---|
-| `ElevatorCar.nextTarget()` | LOOK ordering, reversal at the last *requested* floor | Table-driven: seed `upStops`/`downStops`, assert the exact target sequence |
-| `ElevatorCar` safety | Car never moves while `!door.isClosed()` | Property test: tick 10 000 times with random calls, assert `floor` unchanged whenever the door is open |
-| `ElevatorCar` | Directional correctness | A DOWN call at floor 7 is never served by an UP-committed sweep passing 7 |
-| `Door` | Full OPENING→OPEN→CLOSING→CLOSED cycle; `reopen()` resets dwell | Tick counting |
-| `estimateTicksTo` | Case B (free ride) is cheaper than Cases C/D | Parameterised over all four cases |
-| `CostBasedDispatcher` | The §9.2 scenario picks C, not A | Golden test — this *is* the algorithm's contract |
-| `TrafficMonitor` | Mode detection + hysteresis (no flapping on a single noisy window) | Feed synthetic boarding streams with a fixed `Clock` |
-| `ParkingPolicy` | Even spread in OFF_PEAK; lobby in UP_PEAK; high in DOWN_PEAK | Assert exact floors for 3 cars / 20 floors |
-| `ElevatorSystem` | Hall-call de-duplication; unassigned calls are retried, never dropped | Fill all cars, place a call, free a car, assert assignment |
-| **Simulation** | AWT under each traffic mode | Run 10 000 ticks with a Poisson arrival generator; assert AWT for cost-based < AWT for nearest-car |
+| LOOK order | Stops in the right order; turns around at the last *requested* floor | Set up stops, tick, compare the list of stops |
+| Direction | A DOWN call is never served by a car going UP past it | Same as above (floor 7 in §9.1) |
+| Safety | Car never moves while the door is open | Random property test: 20,000 ticks of random presses |
+| Door | CLOSED → OPENING → OPEN → CLOSING → CLOSED; `open()` again restarts the dwell | Count ticks |
+| ETA | The free ride (case B) is cheaper than a turnaround (cases C/D) | One test per case |
+| Dispatcher | The §9.2 scenario picks car 2, not car 0 | Golden test: this *is* the dispatcher's contract |
+| De-duplication | Two presses = one stop | Count pending stops |
+| Breakdown | Hall calls move to another car; lamp stays lit | §9.3 |
+| Unassigned queue | Call queued when no car is available, assigned once one comes back | Take all cars out, press, return one, tick |
+| Traffic monitor | Up-peak detected after 2 windows, not after 1 | Feed made-up boarding data |
+| Parking | Exact floors per mode | §9.5 table |
+| **Simulation** | Cost-based AWT < nearest-car AWT | §9.4, the most valuable test of all |
 
-The last row is the most valuable test you can build and a great thing to mention: **"I'd validate the dispatcher with a simulation harness measuring average waiting time, not just unit tests — that's the metric the design actually optimises."**
+Example tests (JUnit 5, run against the code above):
+
+```java
+// ElevatorTest.java
+class ElevatorTest {
+
+    private final Building building = new Building(0, 20, 0);
+
+    /** Tick until the car stops somewhere; return "floor+direction" of each stop. */
+    private List<String> stopsMadeBy(ElevatorCar car) {
+        List<String> stops = new ArrayList<>();
+        CarState before = car.state();
+        for (int i = 0; i < 200 && (car.hasPendingStops() || !car.door().isClosed()); i++) {
+            car.tick();
+            if (car.state() == CarState.STOPPED && before != CarState.STOPPED) {
+                stops.add(car.currentFloor() + " " + car.direction());
+            }
+            before = car.state();
+        }
+        return stops;
+    }
+
+    @Test
+    void lookFinishesTheUpSweepBeforeTurningAround() {
+        ElevatorCar car = new ElevatorCar(0, building, 10);
+        car.addCarCall(5);
+        car.addCarCall(9);
+        car.tick(); car.tick(); car.tick();                       // now at floor 3, going UP
+        car.addHallCall(new HallCall(7, Direction.DOWN));
+        car.addHallCall(new HallCall(2, Direction.DOWN));
+
+        assertEquals(List.of("5 UP", "9 UP", "7 DOWN", "2 DOWN"), stopsMadeBy(car));
+    }
+
+    @Test
+    void carNeverMovesWithDoorsOpen() {
+        ElevatorSystem system = ElevatorSystem.create(building, 3, 8);
+        Random random = new Random(42);
+
+        for (int t = 0; t < 20_000; t++) {
+            if (random.nextInt(4) == 0) {
+                system.requestHallCall(1 + random.nextInt(19),
+                        random.nextBoolean() ? Direction.UP : Direction.DOWN);
+            }
+            if (random.nextInt(4) == 0) {
+                system.requestCarCall(random.nextInt(3), random.nextInt(21));
+            }
+
+            List<Integer> openCarFloors = new ArrayList<>();
+            for (ElevatorCar car : system.cars()) {
+                openCarFloors.add(car.door().isClosed() ? null : car.currentFloor());
+            }
+            system.tick();
+            for (ElevatorCar car : system.cars()) {
+                Integer floorWhileOpen = openCarFloors.get(car.id());
+                if (floorWhileOpen != null) {
+                    assertEquals(floorWhileOpen.intValue(), car.currentFloor());
+                }
+            }
+        }
+    }
+
+    @Test
+    void hallCallsOfABrokenCarGoToAnotherCar() {
+        ElevatorSystem system = ElevatorSystem.create(building, 2, 10);
+        system.requestHallCall(15, Direction.DOWN);
+        int owner  = system.car(0).downStops().contains(15) ? 0 : 1;
+        int backup = 1 - owner;
+
+        system.takeOutOfService(owner);
+
+        assertTrue(system.car(backup).downStops().contains(15), "re-dispatched");
+        assertTrue(system.isLit(15, Direction.DOWN), "lamp still lit");
+    }
+
+    @Test
+    void twoPressesAreOneCall() {
+        ElevatorSystem system = ElevatorSystem.create(building, 2, 10);
+        system.requestHallCall(7, Direction.UP);
+        system.requestHallCall(7, Direction.UP);
+
+        int totalStops = system.cars().stream().mapToInt(ElevatorCar::pendingStopCount).sum();
+        assertEquals(1, totalStops);
+    }
+}
+```
+
+> **Line to say:** *"I'd validate the dispatcher with a simulation that measures average waiting time, not just unit tests. That's the number the design is trying to improve."*
 
 ---
 
@@ -1658,48 +1949,88 @@ The last row is the most valuable test you can build and a great thing to mentio
 
 ### 13.1 The 60-second opener
 
-> "There are two separate problems here, and I'll model them separately. First, **which car serves a hall call** — that's the group controller / dispatcher, and I'd use a cost function over estimated time-to-arrival with penalties for load, queue depth and wrong-direction, plus an age term for anti-starvation. Second, **what order one car serves its stops** — that's the LOOK algorithm, and I model it with two `TreeSet`s, one for stops to serve going up and one going down, so 'next stop ahead of me' is an O(log n) `ceiling()` call. The key domain distinction is hall calls versus car calls: a hall call carries a *direction* and belongs to the system, a car call carries a *destination* and belongs to one car. For peak periods I detect the traffic mode from observed boardings rather than the clock, and change the parking policy — lobby during up-peak, spread high during down-peak."
+> "There are two separate problems, and I'll model them separately. First, **which car answers a hall call**. That's the dispatcher. I'd score each car by its estimated time to reach the caller, plus small penalties for busy and crowded cars, and pick the lowest. Second, **in what order one car visits its stops**. That's the LOOK algorithm. I'd use two `TreeSet`s, one for stops going up and one for stops going down, so 'next stop ahead of me' is a single `ceiling()` call. The key domain point is that a hall call has a *direction* and belongs to the building, while a car call has a *destination* and belongs to one car. For rush hours, I'd detect the traffic pattern from boarding data rather than the clock, and change where idle cars park: at the lobby in the morning, spread upstairs in the evening. And the car can never move with its doors open. That's enforced in one place in the code."
 
 ### 13.2 Lines that earn points
 
 - "A hall call has a direction; a car call has a destination. They're different types."
-- "LOOK, not SCAN — SCAN wastes travel to the end of the shaft."
-- "SSTF starves the top floors. That's why I'm not using a nearest-first priority queue."
-- "Case B in the ETA — the free ride — is what nearest-car dispatch misses."
-- "Two `TreeSet`s, not one `PriorityQueue`. `ceiling()` and `floor()` *are* the algorithm."
-- "The car can't move unless the doors are closed, and that's enforced in one place, not by convention."
-- "LOOK prevents starvation within a car; the call-age term prevents it across cars."
-- "I detect up-peak from boarding data, not the wall clock — otherwise it breaks in a hospital."
-- "Idle cars aren't free: parking policy is the cheapest win in peak handling."
+- "LOOK, not SCAN. SCAN wastes travel going to the end of the shaft."
+- "SSTF starves the top floors. That's why I'm not using a closest-first priority queue."
+- "Two `TreeSet`s. `ceiling()` and `floor()` basically *are* the algorithm."
+- "The free-ride case in the ETA is exactly what nearest-car dispatch misses."
+- "No wrong-direction penalty: the ETA already includes the detour."
+- "An age term in the cost does nothing when you score one call at a time. Starvation is handled by LOOK plus immediate assignment plus re-dispatch."
+- "Detect up-peak from boarding data, not the clock. Otherwise it breaks in a hospital."
+- "When a car breaks, its hall calls must go to another car, with their directions."
+- "One control thread, so the domain code needs no locks."
+- "I'd prove the dispatcher is better with a simulation measuring average wait."
 
 ### 13.3 Common traps
 
-| Trap | Wrong answer | Right answer |
+| Question | Weak answer | Strong answer |
 |---|---|---|
-| "How do you store pending stops?" | One `PriorityQueue` by distance | That's SSTF and it starves. Two `TreeSet`s = LOOK. |
-| "Which elevator do you send?" | The closest one | Closest ignores direction and load. Cost/ETA function. |
-| "How do you handle a down request?" | Same as up | Direction is part of the call's identity, or you carry people the wrong way. |
-| "How do you handle rush hour?" | "Add more elevators" | Traffic-mode detection + parking policy + sectoring + capacity-aware dispatch. |
-| "What if two people press up?" | Two requests | One call. `Set` semantics on `(floor, direction)`. |
-| "How does the car stop moving?" | `while(true)` + `sleep` | Discrete tick loop; no sleeping in the domain, so it's testable. |
-| "What about the doors?" | An `isOpen` boolean | A `Door` object with its own state machine — the movement safety invariant depends on it. |
+| How do you store pending stops? | One `PriorityQueue` by distance | That's SSTF and it starves. Two `TreeSet`s = LOOK. |
+| Which car do you send? | The closest one | Closest ignores direction and load. Use an ETA-based cost. |
+| How is a DOWN request different? | It isn't | The direction is part of the call, or you carry people the wrong way. |
+| How do you handle rush hour? | "Add more elevators" | Detect the traffic mode, then change parking, skip full cars, use sectoring. |
+| Two people press UP? | Two requests | One call. `HallCall` is a record in a `Set`/`Map`. |
+| How does time pass? | `while (true)` + `sleep` | A tick loop. The domain has no sleep, so it's testable. Real time only enters in the controller. |
+| What about the doors? | An `isOpen` boolean | A `Door` state machine. The movement safety rule depends on it. |
+| What if a car breaks? | (not considered) | Hand its hall calls to other cars; keep the lamps lit. |
+| Thread safety? | `synchronized` on everything | Single control thread / command queue. |
 
 ### 13.4 If they push further
 
-- **60 floors:** zoning + sky lobbies + express cars. Round-trip time is the metric.
-- **Modern hall interface:** destination dispatch, +20–30% handling capacity.
-- **Provable optimality:** optimal multi-car dispatch is NP-hard (it's a dynamic vehicle-routing problem), so real controllers are heuristic — greedy cost functions, sometimes genetic algorithms or neural dispatchers (Mitsubishi/Fujitec have shipped both).
-- **The metric:** average waiting time and 5-minute handling capacity, validated by simulation, not by intuition.
+- **60 floors:** zoning, sky lobbies, express cars. Round-trip time is the metric.
+- **Modern lobby:** destination dispatch, +20–30% handling capacity.
+- **Is the cost function optimal?** No. Optimal multi-car dispatch is NP-hard (it's a dynamic vehicle-routing problem), so real controllers use heuristics: cost functions, sometimes genetic algorithms or neural networks.
+- **Metrics:** average wait, longest wait, and 5-minute handling capacity (% of the building's population moved in 5 minutes). Always checked with a simulation.
 
 ### 13.5 Complexity
 
 | Operation | Cost |
 |---|---|
-| Add a call to a car | O(log k), k = pending stops ≤ F |
+| Add a stop | O(log k), k = pending stops ≤ floors |
 | `nextTarget()` (LOOK decision) | O(log k) |
-| Dispatch a hall call | O(N · k) worst case for `stopsBetween`; O(N log k) with cached stop counts |
-| One system tick | O(N log k) |
-| Memory | O(N · F) worst case — bounded by floors, so trivially small |
+| Dispatch one hall call | O(N · k): N cars, each ETA walks its stops |
+| One system tick | O(N · k) + parking O(N log N) |
+| Memory | O(N · F): tiny |
+
+---
+
+## 14. What Changed From the Previous Version
+
+### Bugs fixed
+
+| # | Problem in the old version | Fix |
+|---|---|---|
+| 1 | **Taking a car out of service lost its hall calls.** It re-raised them via `requestHallCall`, but the lamps were still lit, so de-duplication ignored them. It also re-raised *both* directions, and turned car calls into fake hall calls. | The car remembers `hallCalls` with their directions; `releaseAllStops()` returns them and the system dispatches them directly. |
+| 2 | **The call-age term in the cost did nothing.** The same age was subtracted from every car's score, and calls are assigned at age ≈ 0. | Removed. §6.5 explains what really prevents starvation (and where age belongs: re-dispatch). |
+| 3 | **Up-peak could never be detected.** Lobby boardings were divided by *all* events (boardings + drop-offs), so the share was capped at 50%, but the threshold was 60%. | Boardings compared with boardings, drop-offs with drop-offs. |
+| 4 | **Hysteresis didn't work.** It advanced every time `currentMode()` was *read*, which happens several times per tick. | `evaluate()` runs once per window; `mode()` is a plain getter. |
+| 5 | Pseudo-code checked UP_PEAK before LUNCH; the Java code did the opposite. | One order everywhere: peaks first, then lunch. |
+| 6 | **Fire service teleported the car** (`currentFloor = designatedFloor`), and the door stayed in OPENING forever. | The car finishes closing, drives there floor by floor, then holds its doors open (`Door.holdOpen()`). |
+| 7 | **Overload threw an exception** in `board()`. | Realistic behaviour: the load is recorded, and the car won't close its doors while overloaded. |
+| 8 | Emergency stop didn't hand back the stuck car's hall calls. | Same handling as maintenance. |
+| 9 | ETA counted stops in *both* directions for the free ride (the car doesn't stop for opposite-direction calls on the way). The "reversal penalty" was an arbitrary number. | Counts only stops in the current direction; the turnaround costs one real stop. |
+| 10 | A wrong-direction penalty was added on top of an ETA that already included the detour (counted twice). | Removed. Cost is now ETA + busy + crowded + one up-peak rule. |
+| 11 | Parking re-set the target to the car's own floor every tick, and the car "arrived" again and again. The UP_PEAK ternary was confusing. | `parkAt()` ignores the car's own floor; the parking rules are one line per mode. |
+| 12 | Walkthrough tick numbers were made up and didn't match the code (a stop takes 5 ticks, not 3). | All walkthroughs now use real output. |
+| 13 | A `Clock` was injected but ticks never moved it forward, so every "time" was the same instant. A sealed `Request`/`CarCall` type was defined but never used. | Time is a tick counter everywhere. Unused types removed. |
+| 14 | No validation of hall buttons (UP on the top floor, floors that don't exist). | `validateHallButton()`. |
+
+### Gaps filled
+
+- **Thread-safety code** (§8.8). It was listed as a requirement before, but never shown.
+- **`Building` record**, which replaces long lists of `int` parameters.
+- **Door state machine diagram**, and a clear 5-ticks-per-stop cost.
+- **Design patterns + SOLID** (§5.7).
+- **Sequence diagram** for a hall call (§7.1).
+- **Wait-time measurement** plus a real simulation result (§9.4).
+- **Breakdown and fire walkthroughs** (§9.3, §9.6).
+- **Runnable JUnit examples** (§12).
+- **Starvation explained properly**, including re-dispatch (§6.5).
+- **Known simplification** documented: a hall call answered by a car other than its owner (§11 #15).
 
 ---
 
