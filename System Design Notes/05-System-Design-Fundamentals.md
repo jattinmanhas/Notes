@@ -4,6 +4,12 @@
 >
 > **The single most important habit:** every section here has a "when NOT to use it". Interviewers grade on *trade-off reasoning*, not vocabulary. Anyone can say "add a cache" — the signal is knowing what it costs you.
 
+> **v2 changes (review pass):**
+> - **Fixed:** the quorum `W > N/2` claim (§5), HyperLogLog error rate (§34), the MongoDB PACELC label (§3), LSM vs B+ tree write amplification (§17), the broken isolation-level table (§19), and missing replication in the Twitter storage estimate (§1).
+> - **Added to existing sections:** single-box capacity numbers (§1), what CAP's "C" actually means (§3), quorum caveats (§5), leases and distributed locks (§5), Go time APIs (§7), the idempotency-key race and the inbox pattern (§8), Redis Cluster hash slots and rendezvous hashing (§11), the cache-aside race condition (§14), write skew and snapshot isolation (§19), scaling WebSockets (§23), retry topics vs ordering (§24), rate limiter in Go (§26), retry amplification (§27), refresh-token rotation (§31).
+> - **New sections:** §36 API Gateway, Service Discovery and Service Mesh · §37 Batch vs Stream Processing (OLTP vs OLAP) · §38 Monolith vs Microservices.
+> - Each Part now opens with a one-line **"why this part exists"** so you know what problem the section solves before you read the details.
+
 ---
 
 ## Table of Contents
@@ -37,6 +43,7 @@
 
 **Part 7 — Specialised**
 - [31. Security](#31-security) · [32. Unique ID Generation](#32-unique-id-generation) · [33. Geospatial](#33-geospatial-indexing) · [34. Probabilistic Structures](#34-probabilistic-data-structures) · [35. Search](#35-search)
+- [36. API Gateway, Service Discovery & Service Mesh](#36-api-gateway-service-discovery--service-mesh) · [37. Batch vs Stream Processing](#37-batch-vs-stream-processing-oltp-vs-olap) · [38. Monolith vs Microservices](#38-monolith-vs-microservices)
 
 **Part 8 — [The Interview Itself](#part-8--the-interview-itself)**
 
@@ -83,6 +90,8 @@
 
 # Part 1 — Foundations
 
+> **Why this part exists:** before you can design anything you need two things: numbers (how big is this?) and vocabulary (what does "good" mean: fast, available, durable?). Every later decision is justified with one or the other.
+
 ## 1. Back-of-the-Envelope Estimation
 
 ### The numbers to memorise
@@ -127,6 +136,18 @@ Typical row      ~1 KB    Tweet (text+meta) ~1 KB    Photo         ~1–5 MB
 | Read 1 MB from HDD | ~2 ms | |
 | Round trip CA ↔ Netherlands | ~150 ms | **speed of light is the floor** |
 
+**What one box can roughly handle.** This is the missing half of estimation. After you compute QPS, the next question is always *"does this fit on one machine?"* These are ballpark ranges for commodity cloud hardware. Real numbers vary 10× with payload size and query shape, so say "roughly" when you use them.
+
+| Component | Rough capacity per node | What it tells you |
+|---|---|---|
+| Stateless API server (Go/Java) | ~1K–10K+ RPS | Horizontal scaling of this tier is trivial, so it's rarely the interesting bottleneck |
+| Postgres/MySQL primary | ~1K–10K simple writes/s; ~10K–50K indexed point reads/s | **Writes on a single primary are usually the first real wall** |
+| Redis | ~100K+ ops/s (single-threaded command execution) | One Redis node absorbs a *lot* of read traffic |
+| Kafka partition | ~10 MB/s-ish sustained per partition; brokers do hundreds of MB/s | Partition count = parallelism, so size it from throughput |
+| Postgres connections | Hundreds, not thousands (each is a process) | Why you need a pooler (PgBouncer) and Little's Law (§2) |
+
+> **How to use it:** "300K read QPS ÷ ~50K per Redis node ≈ 6+ nodes, call it 10 with headroom." One sentence like this turns an estimate into an architecture decision, and that's the whole point of doing estimation.
+
 **The three ratios that matter more than the absolute numbers:**
 
 1. **Memory is ~100× faster than SSD; SSD is ~100× faster than an HDD seek.** → why caching works.
@@ -146,7 +167,9 @@ Read  QPS:  30 B  / 10⁵ s   = 300,000 QPS     peak ≈ 900,000 QPS
                                     ↑ THIS is the number that drives the design
 
 Storage:    300 M tweets/day × 1 KB = 300 GB/day
-            × 365 × 5 years          ≈ 550 TB      → sharding is mandatory
+            × 365 × 5 years          ≈ 550 TB
+            × 3 (replication factor) ≈ 1.6 PB      → sharding is mandatory
+                                    ↑ people forget replication; it triples the answer
 Media:      10% of tweets have a 1 MB image → 30 TB/day → blob storage + CDN
 
 Bandwidth:  read 300 K QPS × 1 KB    = 300 MB/s egress for text alone
@@ -216,13 +239,22 @@ A system can be durable but unavailable (data safe, service down). The reverse �
 
 # Part 2 — Distributed Systems Theory
 
+> **Why this part exists:** the moment you have more than one machine, three things stop being true: the network is reliable, clocks agree, and you can tell a dead node from a slow one. This part covers the rules of that world. Everything in Parts 3–6 is an engineering workaround for these facts.
+
 ## 3. CAP and PACELC
 
 ### CAP, stated precisely
 
 Among **Consistency** (every read sees the most recent write), **Availability** (every request gets a non-error response), and **Partition tolerance** (the system keeps working when the network drops messages), you can guarantee only two.
 
-**The correction that scores points:** *"Partitions aren't a choice — they're a fact of networks. So CAP isn't 'pick two', it's 'when a partition happens, do you sacrifice consistency or availability?' In practice every distributed system is either CP or AP."*
+**The correction that scores points:** *"Partitions aren't a choice — they're a fact of networks. So CAP isn't 'pick two', it's 'when a partition happens, do you sacrifice consistency or availability?'"*
+
+**Two precision points that separate you from most candidates:**
+
+1. **CAP's "C" is linearizability**, meaning "behaves like a single copy". It is *not* the "C" in ACID, which means "invariants hold". Same letter, different idea. Mixing them up is a common tell.
+2. **Many real systems are neither CP nor AP in the strict CAP sense.** A Postgres primary with async replicas can serve stale reads from replicas (so it isn't C), and the minority side can't take writes (so it isn't A either). The labels describe *tendencies*, not proofs. Use them to show which way a system leans, and don't argue over the label.
+
+> **Plain-language version:** the network cut your cluster in half. A user on the smaller half sends a request. You can **refuse it** (CP: correct but unavailable) or **answer with possibly-old data** (AP: available but maybe wrong). That's all CAP says.
 
 | Choice | Behaviour during a partition | Examples |
 |---|---|---|
@@ -239,9 +271,9 @@ This is the more useful framing because partitions are rare and **the latency-vs
 
 | System | PACELC |
 |---|---|
-| Cassandra / Dynamo | PA/EL — available under partition, low latency otherwise |
+| Cassandra / DynamoDB | PA/EL — available under partition, low latency otherwise (both tunable per request) |
 | Spanner | PC/EC — consistent always, pays in latency (TrueTime commit-wait) |
-| MongoDB | PC/EC by default, tunable |
+| MongoDB | **Tunable, so don't give one confident label.** Abadi's original paper classed it PA/EC; with `majority` read/write concern it behaves much closer to PC/EC |
 
 > **The line to use:** *"CAP only tells you about the rare partition case. PACELC points out that even with a healthy network you're trading latency against consistency on every request — and that's the trade-off that actually shapes the design."*
 
@@ -280,9 +312,15 @@ A spectrum, strongest to weakest. Know at least the top and bottom plus read-you
 With `N` replicas, a write needs `W` acks and a read needs `R` responses:
 
 ```
-W + R > N   ⇒   read and write quorums overlap ⇒ reads see the latest write
-W > N/2     ⇒   no two writes can succeed concurrently (prevents split brain)
+W + R > N   ⇒   every read quorum overlaps every write quorum
+                ⇒   at least one node in any read has the latest acknowledged write
+W > N/2     ⇒   any two WRITE quorums overlap
+                ⇒   two conflicting writes always share a node, so the conflict is *detectable*
+                    (it does NOT stop both from succeeding in a leaderless store; in Raft/Paxos
+                    the same majority rule is what stops two leaders both committing)
 ```
+
+**Why overlap works, in plain words:** N=3, W=2, R=2. A write lands on at least 2 of the 3 nodes. A read asks 2 of the 3. With only 3 nodes, two groups of 2 *must* share at least one node, so the read always touches someone who saw the write. That's the pigeonhole principle, nothing more.
 
 | Config (N=3) | Behaviour |
 |---|---|
@@ -292,6 +330,14 @@ W > N/2     ⇒   no two writes can succeed concurrently (prevents split brain)
 | W=1, R=1 | Fast and eventually consistent — no overlap guarantee |
 
 This is exactly Cassandra/DynamoDB's tunable consistency, and being able to derive it live is a strong signal.
+
+**The caveat that shows real depth:** `W + R > N` does **not** make a leaderless store linearizable. It breaks down when:
+
+- **Sloppy quorums / hinted handoff:** during a failure, writes go to stand-in nodes *outside* the normal N, so the "overlap" no longer holds.
+- **Concurrent writes:** both succeed on different nodes, and the store falls back to LWW (see §7) or siblings.
+- **A write that fails partway:** it succeeded on 1 node and isn't rolled back, so some reads see it and some don't.
+
+So say *"W + R > N gives me strong-ish reads in the happy path; if I truly need linearizability I'd use a consensus-based store."*
 
 ### Raft in 60 seconds
 
@@ -308,6 +354,29 @@ Know Raft, not Paxos — it's designed to be explainable, and that's why intervi
 Two nodes both believe they're the leader after a partition, both accept writes, data diverges. Defences: **majority quorum** (a minority partition can't elect a leader), **fencing tokens** (monotonic epoch number; storage rejects writes from a stale leader), and **STONITH** (forcibly kill the old leader).
 
 > This is the same fencing-token argument as the distributed-lock critique in the seat-booking notes — a lock with a TTL is not mutual exclusion without one.
+
+### Leases and distributed locks
+
+A **lease** is a lock with an expiry: "you own this for 10 seconds, renew or lose it." Expiry is necessary, because otherwise a crashed holder would keep the lock forever. It also creates the classic bug:
+
+```
+Client A gets lock (token 33) ──► long GC pause ──────────────► wakes up, writes to storage ✗
+                                   lease expires
+                     Client B gets lock (token 34) ──► writes to storage
+```
+
+A thinks it still holds the lock, but it doesn't. **Nothing on A's side can detect this reliably**, because the pause can happen between *any* two lines of code, including right after A checks the lease.
+
+**Fix: fencing tokens.** The lock service hands out a monotonically increasing number with each grant. The **storage** rejects any write whose token is lower than the highest it has seen. Safety now lives in the resource, not in the client's belief.
+
+| Option | Safe for correctness? | Notes |
+|---|---|---|
+| Redis `SET key val NX PX 10000` | **Efficiency only** | Fine to stop duplicate work (e.g. two cron runners). Not safe if double execution corrupts data |
+| Redlock (multi-node Redis) | Debated | Relies on timing assumptions; the Kleppmann vs antirez debate is worth knowing exists |
+| etcd / ZooKeeper lease + revision as fencing token | **Yes, with fencing** | The right answer when correctness depends on the lock |
+| Database row lock / `SELECT … FOR UPDATE` | Yes, within one DB | Often the simplest correct answer. Don't reach for a distributed lock if the data is in one DB |
+
+> **The line:** *"First I'd ask whether the lock is for efficiency or correctness. For efficiency, a Redis lock is fine. For correctness, the resource must enforce a fencing token, because a lease can always expire behind a paused client's back."*
 
 ---
 
@@ -333,6 +402,7 @@ You cannot distinguish "crashed" from "slow" from "network partitioned". Every f
 - NTP sync itself has error (~1–100 ms) and can step the clock **backwards**.
 - **Therefore:** never use wall-clock comparison across machines to order events or decide who wins a conflict.
 - In Java: use `System.nanoTime()` for durations (monotonic) and `System.currentTimeMillis()` only for wall-clock display. `nanoTime` is not comparable across machines.
+- In Go: `time.Now()` carries **both** a wall-clock and a monotonic reading. `time.Since(start)` and `t2.Sub(t1)` use the monotonic part automatically, so durations are safe even if NTP steps the clock. Serialising a `time.Time` (JSON, DB) or calling `.Round(0)` strips the monotonic reading, so comparisons after that are wall-clock again.
 
 **Last-Write-Wins is a data-loss bug in disguise** when clocks are skewed — the write with the further-ahead clock wins regardless of actual order. Say this if someone proposes LWW.
 
@@ -371,6 +441,17 @@ Kafka's "exactly-once semantics" is precisely this: idempotent producers (sequen
 4. **Conditional update / CAS** — `UPDATE … WHERE version = ?`. Applying twice is a no-op the second time.
 5. **Dedup window** — store recent request IDs in Redis with a TTL. Cheap, but only correct within the window.
 
+**The race inside idempotency keys (a common follow-up):** two retries with the same key arrive *at the same moment*. Both check "have I seen this key?", both get "no", and both execute. A check-then-act is not enough. The fix is to **claim the key first, atomically**:
+
+```
+1. INSERT INTO idempotency (key, status) VALUES (?, 'IN_PROGRESS')   ← unique constraint
+     → conflict?  key exists: if COMPLETED return stored response; if IN_PROGRESS return 409 / retry-later
+2. Do the work
+3. UPDATE idempotency SET status='COMPLETED', response=? WHERE key=?   ← ideally same txn as the effect
+```
+
+The unique constraint makes the DB the referee, so only one request can ever win the insert.
+
 ### The outbox pattern — the dual-write problem
 
 You cannot atomically write to the database *and* publish to Kafka. If you write then publish, a crash in between loses the event; publish then write, and you can emit an event for a transaction that rolled back.
@@ -387,9 +468,20 @@ COMMIT;
 
 This is one of the highest-value patterns to know. It comes up in any design involving a database and a message broker, which is most of them.
 
+**The other half: the inbox pattern (consumer side).** The outbox guarantees the event is published *at least once*, so the consumer will sometimes see duplicates. The consumer records `message_id` in a `processed_messages` table **in the same transaction** as its own business write. A duplicate hits the unique constraint and gets skipped.
+
+```
+Producer:  business write + outbox row   (one txn)  ──► relay ──► Kafka
+Consumer:  Kafka ──► business write + processed_messages row (one txn, unique on message_id)
+```
+
+Outbox + inbox together = effectively-once across two services, using nothing more exotic than local transactions.
+
 ---
 
 # Part 3 — Scaling Primitives
+
+> **Why this part exists:** one machine runs out of CPU, memory, disk, or write capacity. These are the standard moves for spreading load: copy the data (replication), split the data (sharding), spread requests (load balancing), and avoid work (caching).
 
 ## 9. Scaling Basics
 
@@ -507,7 +599,11 @@ With few servers, the ring is unevenly divided and load is lopsided. Also, when 
 
 ### Where it's used, and where it isn't
 
-**Used by:** Memcached/Redis client-side sharding, Cassandra and DynamoDB partitioning, Envoy's ring-hash balancer, CDN request routing.
+**Used by:** Memcached client-side sharding, Cassandra and Dynamo-style partitioning, Envoy's ring-hash balancer, CDN request routing.
+
+**Careful with Redis:** **Redis Cluster does not use a hash ring.** It uses **16,384 fixed hash slots** (`CRC16(key) % 16384`), and each node owns a range of slots. Resharding moves slots between nodes. That is the "logical shards" trick from §12, and it's a good example to drop in.
+
+**Alternative worth one sentence: rendezvous (highest-random-weight) hashing.** For each key, compute `hash(key, server)` for every server and pick the highest. No ring and no virtual nodes, with the same minimal-movement property. It's O(N) per lookup, which is fine for tens of nodes.
 
 **Don't reach for it when:** you have a fixed shard count with an explicit lookup table (a directory-based approach is simpler and lets you move individual shards deliberately), or when your data store already handles rebalancing for you.
 
@@ -624,6 +720,26 @@ Each layer is cheaper and faster than the next one down. "Cache higher up the st
 | **Write-behind** (write-back) | — | Write to cache, flush to DB asynchronously | Very fast writes; **risk of data loss** on cache failure |
 | **Refresh-ahead** | Proactively refresh entries about to expire | — | Avoids miss latency for hot keys; wasteful for cold ones |
 
+### The cache-aside race: why "delete" beats "update", and why it's still not perfect
+
+**Why invalidate (DEL) instead of updating the cache on write?** Two writers updating DB and cache can interleave: A writes DB=1, B writes DB=2, B sets cache=2, A sets cache=1. Now the cache holds 1 forever. Deleting avoids this, because the next reader loads the true value.
+
+**Even DEL has a race.** It's rarer, but interviewers who know caching will ask about it:
+
+```
+Reader: cache miss ──► reads DB (old value v1) ─────────────────────────► SET cache = v1  ✗ stale
+Writer:                          UPDATE DB = v2 ──► DEL cache
+```
+
+The reader's slow `SET` lands *after* the writer's `DEL`, so stale data sits in the cache until the TTL expires.
+
+**Mitigations, from simplest to most robust:**
+
+1. **Always set a TTL.** This bounds how long the staleness can last. It's often enough, so say that first.
+2. **Delayed double delete:** delete, then delete again ~a few hundred ms later.
+3. **Leases (Facebook's memcache paper):** on a miss the cache hands out a lease token, and a later `DEL` invalidates it, so the stale `SET` is rejected.
+4. **Versioned SET:** only write if the version is newer than what's cached (Lua `compare-and-set`).
+
 ### Eviction policies
 
 | Policy | Rule | Best for |
@@ -679,6 +795,8 @@ Geographically distributed edge servers that cache content close to users.
 ---
 
 # Part 4 — Data
+
+> **Why this part exists:** the database is almost always the hardest part of a design, because it's the stateful part. This part covers picking a store, how it works inside, and keeping data correct when many things touch it at once.
 
 ## 16. SQL vs NoSQL
 
@@ -742,7 +860,7 @@ Interviewers push here because it separates people who've *used* a database from
 |---|---|---|
 | Write path | Random, in place | Sequential, append-only |
 | Read amplification | Low | Higher (several files) |
-| Write amplification | Moderate | Higher (compaction), but sequential |
+| Write amplification | Rewrites a whole page (4–16 KB) for a tiny row change | Compaction rewrites data several times — **but sequentially**. Which is "worse" depends on workload; the real win is that LSM's writes are sequential |
 | Space | Fragmentation from splits | Better compression; temporary duplicate space |
 | Choose for | Read-heavy, OLTP, range queries | Write-heavy, time series, logs |
 
@@ -782,14 +900,24 @@ Interviewers push here because it separates people who've *used* a database from
 
 ### Isolation levels — the table to have memorised
 
-| Level | Dirty read | Non-repeatable read | Phantom |
-|---|---|---|---|
-| READ UNCOMMITTED | ✅ possible | ✅ | ✅ |
-| **READ COMMITTED** | ❌ | ✅ | ✅ | ← *Postgres/Oracle default* |
-| **REPEATABLE READ** | ❌ | ❌ | ✅ (❌ in InnoDB) | ← *MySQL default* |
-| SERIALIZABLE | ❌ | ❌ | ❌ |
+First, the anomalies in plain words:
 
-**Key point that gets missed:** READ COMMITTED does **not** prevent lost updates. Two transactions read a value, both write, one is silently overwritten. You need `SELECT … FOR UPDATE`, an optimistic version check, or SERIALIZABLE.
+- **Dirty read:** you see another transaction's write *before it commits*, and it may roll back.
+- **Non-repeatable read:** you read a row twice in one transaction and get different values.
+- **Phantom:** you run the same `WHERE` query twice and **new rows** appear.
+- **Lost update:** two transactions read-modify-write the same row, and one write silently vanishes.
+- **Write skew:** two transactions read the *same* data, each writes to a *different* row, and together they break a rule neither broke alone. (Classic example: two on-call doctors both check "is someone else on call? yes", and both go off call. Now nobody is on call.)
+
+| Level | Dirty read | Non-repeatable | Phantom | Lost update | Write skew | Default in |
+|---|---|---|---|---|---|---|
+| READ UNCOMMITTED | possible | possible | possible | possible | possible | — |
+| **READ COMMITTED** | prevented | possible | possible | possible | possible | **Postgres, Oracle, SQL Server** |
+| **REPEATABLE READ** | prevented | prevented | Postgres: prevented · InnoDB: prevented (snapshot for plain reads, gap locks for locking reads) | **Postgres: prevented (aborts) · InnoDB: possible** | possible | **MySQL InnoDB** |
+| SERIALIZABLE | prevented | prevented | prevented | prevented | **prevented** | — |
+
+**Key point that gets missed:** READ COMMITTED does **not** prevent lost updates. Two transactions read a value, both write, one is silently overwritten. You need `SELECT … FOR UPDATE`, an atomic update (`SET x = x - 1`), an optimistic version check, or SERIALIZABLE.
+
+**The deeper point:** Postgres's REPEATABLE READ is really **snapshot isolation**, where each transaction sees a frozen snapshot. Snapshot isolation still allows **write skew**, because each transaction checks a condition against its own snapshot and writes a different row, so there's no row conflict to detect. Only SERIALIZABLE (Postgres uses SSI, Serializable Snapshot Isolation) or explicit locking of the rows you *read* (`FOR UPDATE`) prevents it. Seat booking, "max N items per user", and on-call rotas are all write-skew problems.
 
 **MVCC** (multi-version concurrency control) is how Postgres/InnoDB deliver isolation without read locks: each transaction sees a snapshot; writers create new row versions instead of blocking readers. Trade-off: version bloat and vacuum/purge overhead. *"Readers don't block writers and writers don't block readers"* is the sentence to have ready.
 
@@ -828,7 +956,7 @@ Step 3 fails → run compensations for 2 and 1, in reverse order.
 
 **Critical caveats to raise unprompted:**
 
-- Sagas give **atomicity but not isolation** — intermediate states are visible to other transactions. Handle with semantic locks (an `PENDING` status), commutative updates, or by accepting it.
+- Sagas give **atomicity but not isolation** — intermediate states are visible to other transactions. Handle with semantic locks (a `PENDING` status), commutative updates, or by accepting it.
 - **Compensations aren't perfect rollbacks.** You can't un-send an email. Design compensations that are semantically meaningful (send a cancellation notice), not literal undos.
 - Every step must be **idempotent**, because retries are guaranteed.
 
@@ -858,6 +986,8 @@ Why it matters: your API servers never handle file bytes, so they don't need ban
 ---
 
 # Part 5 — Communication
+
+> **Why this part exists:** services have to talk to each other and to clients. The core choice is always "does the caller wait for the answer (sync) or not (async)?", and then which protocol fits.
 
 ## 22. Sync vs Async
 
@@ -898,6 +1028,21 @@ Why it matters: your API servers never handle file bytes, so they don't need ban
 | Headers | Plain text | Compressed (HPACK) | Compressed (QPACK) |
 | Notable | Keep-alive, pipelining (broken in practice) | Server push (largely deprecated) | 0-RTT resumption, survives network switching |
 
+### Scaling WebSockets: the part everyone skips
+
+WebSockets make servers **stateful**: user 42 is connected to gateway-7 specifically. That breaks the "any server can handle any request" rule. You need three pieces:
+
+1. **Connection gateways:** a dedicated tier that only holds sockets. Each box holds tens to hundreds of thousands of mostly idle connections (bounded by memory and file descriptors, not CPU).
+2. **Connection registry:** `user_id → gateway_id` in Redis, written on connect and deleted on disconnect, with a TTL refreshed by heartbeats.
+3. **Routing between gateways:** a message for user 42 is published to gateway-7's channel (Redis pub/sub, or a Kafka topic per gateway), or the sender looks up the registry and calls gateway-7 directly.
+
+```
+Sender ──► Chat service ──► registry: user 42 → gw-7 ──► pub/sub "gw-7" ──► gw-7 ──► socket ──► user 42
+                                     (not found → user offline → store + push notification)
+```
+
+**Operational gotchas worth a sentence:** L4 load balancing or L7 with long idle timeouts; **deploys drop every socket**, so drain gradually and have clients reconnect with jittered backoff (otherwise you get a reconnect stampede); and always pair the socket with a **durable store**, because the socket is a delivery optimisation and not the source of truth. On reconnect the client asks "give me everything after message X".
+
 **The realtime decision path** — a common follow-up:
 
 ```
@@ -935,6 +1080,8 @@ Mobile with unreliable networks?                 → Push notifications (APNs/FC
 - **Point-to-point:** one message → one consumer. Task queues.
 - **Pub/sub:** one message → all subscribers. Fan-out.
 - **Competing consumers:** many workers on one queue for horizontal throughput.
+- **Retry topics vs ordering:** if a message fails and you move it to a retry topic so the partition keeps flowing, **you've given up per-key ordering** for that key. If ordering matters (account events), either block the partition and retry in place, or park *every later message for that key* until the failed one clears. Name the trade-off; there isn't a free answer.
+- **Consumer lag** (latest offset − committed offset) is *the* metric for a stream consumer. Alert on lag growing, not on CPU.
 - **Dead-letter queue (DLQ):** after N failed attempts, move the message aside so it stops blocking the queue, and alert. **Always mention the DLQ** — a poison message that retries forever is a classic outage, and most candidates forget it.
 
 ### Backpressure
@@ -971,6 +1118,8 @@ URL path (`/v1/users`) is the most explicit and easiest to route. Alternatives: 
 
 # Part 6 — Reliability
 
+> **Why this part exists:** everything fails. This part covers stopping one failure from becoming a total outage, seeing failures when they happen, and shipping changes without causing them.
+
 ## 26. Rate Limiting
 
 Protects against abuse, accidental overload, and cost blowouts. **Know all five algorithms and their trade-offs** — this is one of the most commonly asked topics, and it's also a standalone design question.
@@ -985,16 +1134,26 @@ Protects against abuse, accidental overload, and cost blowouts. **Know all five 
 
 **Choosing:** **token bucket** is the usual answer — O(1) memory, allows legitimate bursts, simple to reason about. Use **leaky bucket** when the *downstream* needs a strictly smooth rate (e.g. calling a third-party API with a hard rate cap).
 
-```java
-// Token bucket — lazy refill, no background timer. This is the whole algorithm.
-long now = clock.millis();
-double refill = (now - lastRefillMs) / 1000.0 * refillRatePerSec;
-tokens = Math.min(capacity, tokens + refill);
-lastRefillMs = now;
+```go
+// Token bucket — lazy refill, no background goroutine. This is the whole algorithm.
+func (b *Bucket) Allow() bool {
+    b.mu.Lock()
+    defer b.mu.Unlock()
 
-if (tokens >= 1) { tokens -= 1; return ALLOW; }
-return REJECT;   // respond 429 with a Retry-After header
+    now := time.Now()                                   // monotonic-safe for Sub()
+    elapsed := now.Sub(b.last).Seconds()
+    b.tokens = math.Min(b.capacity, b.tokens+elapsed*b.ratePerSec)
+    b.last = now
+
+    if b.tokens >= 1 {
+        b.tokens--
+        return true
+    }
+    return false // respond 429 with a Retry-After header
+}
 ```
+
+*(Production Go: `golang.org/x/time/rate` is exactly this. The distributed version is the same maths inside a Redis Lua script, so the read-refill-decrement is atomic.)*
 
 ### Distributed rate limiting
 
@@ -1020,6 +1179,8 @@ Per-instance limits don't work — 10 instances with a 100/s limit each is a 100
 Retry only **idempotent** operations and only **retriable** failures (5xx, timeouts, 429 — never 400 or 401). Use exponential backoff with **jitter** to avoid a synchronised retry storm.
 
 **Add a retry budget:** cap retries at ~10% of the request rate globally (Google SRE's guidance). Without it, a partial outage becomes a full one as retries multiply load exactly when the system is weakest. *(Full treatment in the payment-retry notes.)*
+
+**Retry amplification — the multi-layer trap.** If the gateway retries 3×, the service retries 3×, and the DB client retries 3×, one user request can become **3 × 3 × 3 = 27** DB calls during an outage. That's exactly when the DB can least afford it. **Rule: retry at one layer only** (usually the one closest to the caller, or the one that knows the operation is idempotent), and have the other layers fail fast.
 
 ### Circuit breaker
 
@@ -1125,6 +1286,8 @@ Never rename or drop a column in the same deploy as the code change — during a
 
 # Part 7 — Specialised Topics
 
+> **Why this part exists:** building blocks that only show up in certain questions, like IDs in URL shorteners, geo in Uber, and search in e-commerce. When one of these questions comes up, the interviewer expects you to know that block properly.
+
 ## 31. Security
 
 ### AuthN vs AuthZ
@@ -1140,6 +1303,8 @@ Never rename or drop a column in the same deploy as the code change — during a
 | **API keys / mTLS** | Static secret / mutual certs | Service-to-service |
 
 **The JWT revocation problem** — a guaranteed follow-up. A JWT is valid until it expires; you can't un-issue it. Mitigations: **short-lived access tokens (5–15 min) + a long-lived refresh token** that *is* checked against a revocable store, plus a denylist of revoked JTIs for emergencies. Say the short-lived-access-token answer first.
+
+**Refresh-token rotation with reuse detection** (your home turf, so expect depth): every refresh issues a **new** refresh token and invalidates the old one. If an **old** refresh token is ever presented again, someone has stolen it, because the legitimate client already moved on. So **revoke the whole token family** and force a re-login. This turns a stolen long-lived token from "silent persistent access" into "detected on first use".
 
 ### Other essentials
 
@@ -1209,14 +1374,14 @@ Trade exactness for enormous space savings. Interviewers love these because they
 |---|---|---|---|
 | **Bloom filter** | "Have I seen X?" | **False positives possible, false negatives impossible** | ~10 bits per element for 1% FPR |
 | **Counting Bloom / Cuckoo filter** | Same, but supports deletion | Same | Slightly more |
-| **HyperLogLog** | "How many *distinct* items?" | ~2% standard error | **~12 KB for billions of items** |
+| **HyperLogLog** | "How many *distinct* items?" | **~0.81% standard error** (Redis's implementation) | **~12 KB for billions of items** |
 | **Count-Min Sketch** | "How often did X appear?" | Overestimates only | Sublinear |
 | **Top-K / Space-Saving** | "What are the heaviest hitters?" | Approximate | Sublinear |
 
 **Where they show up in designs:**
 
 - **Bloom filter** in front of a cache or database to avoid lookups for keys that don't exist (**cache penetration**, §14); inside every LSM-tree SSTable to skip files during reads (§17); in a crawler to check "already visited".
-- **HyperLogLog** for unique-visitor counts — Redis has `PFADD`/`PFCOUNT` built in. Counting 1 B unique users exactly needs gigabytes; HLL needs 12 KB with 2% error, and nobody cares about 2% on a dashboard.
+- **HyperLogLog** for unique-visitor counts — Redis has `PFADD`/`PFCOUNT` built in. Counting 1 B unique users exactly needs gigabytes; HLL needs 12 KB with <1% error, and nobody cares about 1% on a dashboard. HLLs also **merge** (`PFMERGE`), so you can keep one per day and union them into a weekly count. You can't do that by adding daily unique counts.
 - **Count-Min Sketch** for detecting hot keys and heavy hitters in a stream.
 
 > **The framing:** *"A Bloom filter can tell you 'definitely not present' or 'probably present'. That asymmetry is exactly what you want in front of an expensive lookup — a false positive costs one wasted query, and false negatives can't happen, so you never miss real data."*
@@ -1245,6 +1410,85 @@ Query "database system" → intersect the two posting lists
 - The sync is **eventually consistent**; a document may be searchable a second or two after it's written. Usually fine — confirm it with the interviewer.
 - **Autocomplete** is a different problem: use a **trie** (or an FST/completion suggester), not full-text search, and precompute the top-N completions per prefix.
 - Sharding + replicas: shards for index size and write throughput, replicas for query throughput and availability.
+
+---
+
+## 36. API Gateway, Service Discovery & Service Mesh
+
+The skeleton in Part 8 has an "API Gateway" box. Here's what it does, and how it differs from the load balancer and the mesh. Candidates often use these three terms interchangeably, and they aren't the same thing.
+
+| Component | Sits where | Job | Examples |
+|---|---|---|---|
+| **Load balancer** | In front of *one* service's instances | Spread traffic, health-check, TLS termination | NLB/ALB, HAProxy |
+| **API gateway** | At the **edge**, in front of *all* services | The single public entry point: routing (`/orders → order-svc`), **authN**, **rate limiting**, request/response transformation, API keys, aggregation | Kong, AWS API Gateway, Envoy/NGINX configured as a gateway |
+| **Service mesh** | **Between** internal services (sidecar per pod) | Service-to-service **mTLS**, retries, timeouts, circuit breaking, traffic splitting, telemetry, with **no application code** | Istio, Linkerd |
+
+**Service discovery** answers "where is order-svc right now?" when instances come and go:
+
+- **Client-side:** the client asks a registry (Consul, etcd, Eureka) and load-balances itself. One fewer hop, but every client needs the logic.
+- **Server-side:** the client calls a stable name, and the platform routes it. This is **Kubernetes Services + DNS**, the usual answer today.
+
+**Trade-offs to say out loud:**
+
+- The gateway is on *every* request, so it must be horizontally scaled and stateless, and it's a latency and availability tax. Keep business logic out of it.
+- **BFF (Backend-for-Frontend):** one gateway per client type (mobile vs web) when their data needs differ a lot.
+- A mesh is powerful but operationally heavy. For a handful of services, a good HTTP client library with timeouts and retries is enough. Say *"I'd adopt a mesh when the number of services makes per-library consistency impossible."*
+
+---
+
+## 37. Batch vs Stream Processing (OLTP vs OLAP)
+
+Any design with "analytics", "top-K", "dashboards", "billing aggregation" or "recommendations" needs this section.
+
+**First split: OLTP vs OLAP**
+
+| | **OLTP** (your app's DB) | **OLAP** (analytics warehouse) |
+|---|---|---|
+| Query shape | Many small reads/writes by key | Few huge scans and aggregations |
+| Storage layout | **Row-oriented** (fetch a whole row fast) | **Column-oriented** (read 2 columns of a billion rows, compress well) |
+| Examples | Postgres, MySQL | BigQuery, Snowflake, Redshift, ClickHouse, Druid |
+
+**Never run analytics on your OLTP primary.** A big `GROUP BY` will starve user-facing queries. Ship data out with CDC or events into a warehouse.
+
+**Second split: batch vs stream**
+
+| | **Batch** | **Stream** |
+|---|---|---|
+| Input | Bounded dataset ("yesterday's logs") | Unbounded, arriving continuously |
+| Latency | Minutes to hours | Milliseconds to seconds |
+| Correctness | Easy: reprocess the whole thing | Hard: late events, out-of-order, state, exactly-once |
+| Tools | Spark, MapReduce, SQL in the warehouse | Flink, Kafka Streams, Spark Structured Streaming |
+
+**Stream concepts to name:**
+
+- **Windows:** tumbling (fixed, non-overlapping: "clicks per minute"), sliding (overlapping), session (gap-based: "user activity bursts").
+- **Event time vs processing time:** aggregate by *when it happened*, not when it arrived. A phone that was offline sends 10-minute-old events.
+- **Watermarks:** "I believe I've seen everything up to time T." These let a window close even though late events are possible. Very late events are dropped or sent to a correction path.
+
+**Architectures:**
+
+- **Lambda:** a stream layer for fast approximate results plus a batch layer for correct results, merged at query time. Correct, but **two codebases** for the same logic.
+- **Kappa:** stream only. To reprocess, replay the Kafka log through a new version of the job. One codebase, and the usual modern choice.
+
+> **The line:** *"Real-time path with Flink over Kafka for the dashboard, windowed by event time with watermarks. Raw events also land in object storage so I can recompute exact numbers in batch if billing needs them. Fast and approximate for display, slow and exact for money."*
+
+---
+
+## 38. Monolith vs Microservices
+
+Interviewers ask this to see whether you reach for microservices by reflex.
+
+| | **Monolith (modular)** | **Microservices** |
+|---|---|---|
+| Deploy | One unit | Independent per service |
+| Calls between parts | Function call (ns, can't partially fail) | Network call (ms, **can** fail, needs timeouts/retries/idempotency) |
+| Transactions | Local ACID | Sagas (§20), outbox (§8) |
+| Scaling | Whole app together | Per service |
+| What it really buys | Simplicity, easy refactoring | **Team independence**: many teams shipping without coordinating |
+
+**The honest position:** microservices mainly solve an **organisational** problem (many teams stepping on each other), not a technical one. Every in-process call you turn into a network call picks up all of Part 6's failure modes. Start with a **modular monolith** with clean internal boundaries, then extract a service when a module needs independent scaling, a different tech stack, or a separate team.
+
+**Drawing service boundaries:** split by **business capability / data ownership** (orders, payments, inventory), never by technical layer ("DB service", "validation service"). **Each service owns its data, and no other service reads its tables.** If two services always change together or constantly need each other's data synchronously, they're one service split in the wrong place, which people call a "distributed monolith".
 
 ---
 
@@ -1292,6 +1536,8 @@ Walk the ladder, in order, and justify each step from the numbers:
 | "How do you monitor this?" | Operational maturity | RED/golden signals, alert on symptoms, trace IDs |
 | "What would you do differently with more time?" | Self-awareness | Have two honest answers ready |
 | "How do you deploy without downtime?" | Practical experience | Rolling/canary + expand-contract migrations |
+| "What if the lock holder pauses / the lease expires?" | Distributed-systems depth | Fencing tokens enforced by the resource (§5) |
+| "What if two requests with the same idempotency key race?" | Concurrency depth | Claim the key with a unique-constraint insert first (§8) |
 
 ## The trade-off sentences to have ready
 
@@ -1313,7 +1559,9 @@ Memory ~100× SSD ~100× HDD seek
 Same-DC round trip ~0.5 ms      Cross-continent ~150 ms
 99.9% = 43 min/month down       99.99% = 4.3 min/month
 
-W + R > N  ⇒ quorum overlap ⇒ consistent reads
+W + R > N  ⇒ read/write quorums overlap (happy path; not linearizable)
+Postgres primary ~1–10K writes/s   Redis ~100K ops/s   API box ~1–10K RPS
+Storage estimate → remember ×3 for replication
 Concurrency = Throughput × Latency        (Little's Law)
 Series availability multiplies; parallel redundancy adds nines
 ```
@@ -1330,4 +1578,4 @@ Series availability multiplies; parallel redundancy adds nines
 
 ---
 
-*End of fundamentals. Next: applying these to specific design questions.*
+*End of fundamentals.*
